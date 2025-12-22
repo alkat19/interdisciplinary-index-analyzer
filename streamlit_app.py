@@ -181,25 +181,36 @@ async def fetch_citing_abstracts_parallel(citing_ids: list[str], client: httpx.A
 # ============================================================================
 
 def create_field_breakdown_chart(field_counts: dict) -> go.Figure:
+    """Create a horizontal bar chart showing citation field distribution"""
     if not field_counts:
         return None
     sorted_fields = sorted(field_counts.items(), key=lambda x: x[1], reverse=True)[:10]
+    # Reverse for horizontal bar (bottom to top)
+    sorted_fields = sorted_fields[::-1]
     labels = [f[0] for f in sorted_fields]
     values = [f[1] for f in sorted_fields]
 
-    fig = go.Figure(data=[go.Pie(
-        labels=labels, values=values,
-        hole=0.4,
-        marker_colors=px.colors.qualitative.Set3[:len(labels)],
-        textinfo='percent+label',
-        textposition='outside'
+    # Color gradient from light to dark
+    colors = px.colors.sequential.Purples[3:3+len(labels)] if len(labels) <= 7 else px.colors.sequential.Purples[2:]
+
+    fig = go.Figure(data=[go.Bar(
+        y=labels,
+        x=values,
+        orientation='h',
+        marker_color=colors[:len(labels)] if len(colors) >= len(labels) else '#6366f1',
+        text=[str(v) for v in values],
+        textposition='outside',
+        textfont=dict(size=11, color='#64748b'),
+        hovertemplate="<b>%{y}</b><br>Count: %{x}<extra></extra>"
     )])
     fig.update_layout(
-        title="Citation Fields Breakdown",
-        showlegend=False,
+        title=dict(text="Citation Fields Breakdown", font=dict(size=16, color='#1e293b')),
         paper_bgcolor='rgba(0,0,0,0)',
         plot_bgcolor='rgba(0,0,0,0)',
-        margin=dict(t=60, b=40, l=40, r=40)
+        margin=dict(t=60, b=40, l=150, r=60),
+        xaxis=dict(title="Number of Citing Papers", showgrid=True, gridcolor='#f1f5f9', zeroline=False),
+        yaxis=dict(title="", tickfont=dict(size=11)),
+        font=dict(family="Inter")
     )
     return fig
 
@@ -374,6 +385,73 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str, progr
 # STREAMLIT UI
 # ============================================================================
 
+def display_author_results(result, author_name):
+    """Display analysis results for a single author"""
+    # Metrics row
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        st.metric(
+            "Author Index",
+            f"{result['author_index']:.1f}%",
+            help="Average interdisciplinary index across all papers"
+        )
+        st.caption(f"{get_category_emoji(result['category'])} {result['category']}")
+    with col2:
+        st.metric(
+            "Highest Paper",
+            f"{result['max_index']:.1f}%",
+            help="Most interdisciplinary paper"
+        )
+    with col3:
+        st.metric(
+            "Papers Analyzed",
+            len(result['df']),
+            help="Number of papers included in analysis"
+        )
+
+    # Cache status
+    if result['was_cached'] and result['cache_time']:
+        st.info(f"📦 Using cached data from {result['cache_time'].strftime('%b %d, %Y')}")
+    else:
+        st.success("✨ Fresh analysis completed")
+
+    st.markdown("---")
+
+    # Charts in 2x2 grid
+    col1, col2 = st.columns(2)
+    with col1:
+        st.plotly_chart(result['scatter'], use_container_width=True)
+    with col2:
+        st.plotly_chart(result['kde_fig'], use_container_width=True)
+
+    col3, col4 = st.columns(2)
+    with col3:
+        if result['field_chart']:
+            st.plotly_chart(result['field_chart'], use_container_width=True)
+    with col4:
+        if result['keyword_chart']:
+            st.plotly_chart(result['keyword_chart'], use_container_width=True)
+
+    # Data table
+    st.markdown("### 📄 Paper Details")
+    display_df = result['df'].rename(columns={
+        "title": "Title",
+        "year": "Year",
+        "paper_index": "Index (%)",
+        "citation_count": "Citations"
+    })
+    st.dataframe(display_df, use_container_width=True)
+
+    # Download CSV
+    csv = display_df.to_csv(index=False)
+    st.download_button(
+        "📥 Download CSV",
+        csv,
+        f"interdisciplinary_{author_name.replace(' ', '_')}.csv",
+        "text/csv"
+    )
+
+
 def main():
     # Custom CSS
     st.markdown("""
@@ -396,6 +474,22 @@ def main():
     .stDataFrame {
         border-radius: 0.5rem;
     }
+    .comparison-card {
+        background: linear-gradient(135deg, #6366f1 0%, #8b5cf6 100%);
+        padding: 1.5rem;
+        border-radius: 1rem;
+        color: white;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
+    .comparison-card-cyan {
+        background: linear-gradient(135deg, #06b6d4 0%, #0891b2 100%);
+        padding: 1.5rem;
+        border-radius: 1rem;
+        color: white;
+        text-align: center;
+        margin-bottom: 1rem;
+    }
     </style>
     """, unsafe_allow_html=True)
 
@@ -407,155 +501,234 @@ def main():
     </div>
     """, unsafe_allow_html=True)
 
-    # Sidebar
-    with st.sidebar:
-        st.header("🔍 Author Search")
-        author_name = st.text_input("Enter author name", placeholder="e.g., Geoffrey Hinton")
+    # Create tabs
+    tab1, tab2, tab3 = st.tabs(["🔬 Single Author", "⚖️ Compare Authors", "📘 About"])
 
-        st.markdown("---")
-        st.markdown("### Quick Examples")
+    # ==================== TAB 1: SINGLE AUTHOR ====================
+    with tab1:
+        st.markdown("### Search for Researcher")
+        col1, col2 = st.columns([3, 1])
+        with col1:
+            author_name = st.text_input("Enter author name", placeholder="e.g., Geoffrey Hinton", key="single_author")
+        with col2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            search_button = st.button("🔬 Analyze", type="primary", use_container_width=True, key="single_search")
+
+        # Quick examples
+        st.markdown("**Quick examples:**")
+        example_cols = st.columns(4)
         example_authors = ["Geoffrey Hinton", "Yann LeCun", "Yoshua Bengio", "Fei-Fei Li"]
-        for example in example_authors:
-            if st.button(example, key=f"example_{example}"):
-                author_name = example
-                st.session_state.author_name = example
+        for i, example in enumerate(example_authors):
+            with example_cols[i]:
+                if st.button(example, key=f"example_{example}", use_container_width=True):
+                    st.session_state.single_author = example
+                    st.rerun()
 
-        st.markdown("---")
-        st.markdown("### About")
-        st.markdown("""
-        This tool analyzes how interdisciplinary a researcher's work is by:
-        1. Fetching their top cited papers
-        2. Analyzing citing papers
-        3. Computing semantic similarity
-        4. Higher index = more interdisciplinary
-        """)
-
-    # Main content
-    if author_name:
-        search_button = st.button("🔬 Analyze Author", type="primary", use_container_width=True)
-
-        if search_button:
+        if search_button and author_name:
             # Search for author
             with st.spinner("Searching for author..."):
                 candidates = asyncio.run(search_authors(author_name, limit=5))
 
             if not candidates:
                 st.error(f"Could not find author '{author_name}' in OpenAlex.")
-                return
-
-            # Show disambiguation if multiple results
-            if len(candidates) > 1:
-                st.markdown("### Select Author")
-                selected_idx = st.selectbox(
-                    "Multiple authors found. Please select:",
-                    range(len(candidates)),
-                    format_func=lambda i: f"{candidates[i]['name']} | {candidates[i]['institution']} | {candidates[i]['works_count']} works"
-                )
-                selected_author = candidates[selected_idx]
             else:
-                selected_author = candidates[0]
+                # Show disambiguation if multiple results
+                if len(candidates) > 1:
+                    selected_idx = st.selectbox(
+                        "Multiple authors found. Please select:",
+                        range(len(candidates)),
+                        format_func=lambda i: f"{candidates[i]['name']} | {candidates[i]['institution']} | {candidates[i]['works_count']} works"
+                    )
+                    selected_author = candidates[selected_idx]
+                else:
+                    selected_author = candidates[0]
 
-            # Progress indicators
-            progress_bar = st.progress(0)
-            status_text = st.empty()
+                # Progress indicators
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-            # Run analysis
-            result, error = asyncio.run(analyze_author(
-                selected_author['id'],
-                selected_author['name'],
-                st.session_state.cache_dir,
-                progress_bar,
-                status_text
-            ))
+                # Run analysis
+                result, error = asyncio.run(analyze_author(
+                    selected_author['id'],
+                    selected_author['name'],
+                    st.session_state.cache_dir,
+                    progress_bar,
+                    status_text
+                ))
 
-            if error:
-                st.error(error)
-                return
+                if error:
+                    st.error(error)
+                else:
+                    st.markdown("---")
+                    display_author_results(result, selected_author['name'])
 
-            # Display results
-            st.markdown("---")
+    # ==================== TAB 2: COMPARE AUTHORS ====================
+    with tab2:
+        st.markdown("### Compare Two Researchers")
+        st.markdown("Analyze and compare the interdisciplinary profiles of two researchers side by side.")
 
-            # Metrics row
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric(
-                    "Author Index",
-                    f"{result['author_index']:.1f}%",
-                    help="Average interdisciplinary index across all papers"
-                )
-                st.caption(f"{get_category_emoji(result['category'])} {result['category']}")
-            with col2:
-                st.metric(
-                    "Highest Paper",
-                    f"{result['max_index']:.1f}%",
-                    help="Most interdisciplinary paper"
-                )
-            with col3:
-                st.metric(
-                    "Papers Analyzed",
-                    len(result['df']),
-                    help="Number of papers included in analysis"
-                )
+        col1, col2 = st.columns(2)
+        with col1:
+            author1_name = st.text_input("First Author", placeholder="e.g., Geoffrey Hinton", key="author1")
+        with col2:
+            author2_name = st.text_input("Second Author", placeholder="e.g., Yann LeCun", key="author2")
 
-            # Cache status
-            if result['was_cached'] and result['cache_time']:
-                st.info(f"📦 Using cached data from {result['cache_time'].strftime('%b %d, %Y')}")
+        compare_button = st.button("⚖️ Compare Authors", type="primary", use_container_width=True)
+
+        if compare_button and author1_name and author2_name:
+            # Search for both authors
+            with st.spinner("Searching for authors..."):
+                candidates1 = asyncio.run(search_authors(author1_name, limit=1))
+                candidates2 = asyncio.run(search_authors(author2_name, limit=1))
+
+            if not candidates1:
+                st.error(f"Could not find author '{author1_name}' in OpenAlex.")
+            elif not candidates2:
+                st.error(f"Could not find author '{author2_name}' in OpenAlex.")
             else:
-                st.success("✨ Fresh analysis completed")
+                author1 = candidates1[0]
+                author2 = candidates2[0]
 
-            st.markdown("---")
+                # Progress bar
+                progress_bar = st.progress(0)
+                status_text = st.empty()
 
-            # Charts in 2x2 grid
-            col1, col2 = st.columns(2)
-            with col1:
-                st.plotly_chart(result['scatter'], use_container_width=True)
-            with col2:
-                st.plotly_chart(result['kde_fig'], use_container_width=True)
+                # Analyze first author
+                status_text.text(f"Analyzing {author1['name']}...")
+                result1, error1 = asyncio.run(analyze_author(
+                    author1['id'], author1['name'],
+                    st.session_state.cache_dir,
+                    progress_bar, status_text
+                ))
 
-            col3, col4 = st.columns(2)
-            with col3:
-                if result['field_chart']:
-                    st.plotly_chart(result['field_chart'], use_container_width=True)
-            with col4:
-                if result['keyword_chart']:
-                    st.plotly_chart(result['keyword_chart'], use_container_width=True)
+                if error1:
+                    st.error(f"Error analyzing {author1['name']}: {error1}")
+                else:
+                    # Reset progress for second author
+                    progress_bar.progress(0)
+                    status_text.text(f"Analyzing {author2['name']}...")
 
-            # Data table
-            st.markdown("### 📄 Paper Details")
-            display_df = result['df'].rename(columns={
-                "title": "Title",
-                "year": "Year",
-                "paper_index": "Index (%)",
-                "citation_count": "Citations"
-            })
-            st.dataframe(display_df, use_container_width=True)
+                    result2, error2 = asyncio.run(analyze_author(
+                        author2['id'], author2['name'],
+                        st.session_state.cache_dir,
+                        progress_bar, status_text
+                    ))
 
-            # Download CSV
-            csv = display_df.to_csv(index=False)
-            st.download_button(
-                "📥 Download CSV",
-                csv,
-                f"interdisciplinary_{selected_author['name'].replace(' ', '_')}.csv",
-                "text/csv"
-            )
+                    if error2:
+                        st.error(f"Error analyzing {author2['name']}: {error2}")
+                    else:
+                        status_text.text("Comparison complete!")
+                        progress_bar.progress(1.0)
 
-            # Methodology
-            with st.expander("📘 Methodology"):
-                st.markdown("""
-                **How It Works:**
+                        st.markdown("---")
 
-                1. Fetches the author's top 10 most-cited papers from OpenAlex
-                2. For each paper, retrieves 10 recent citing papers
-                3. Computes semantic similarity between original and citing abstracts using Model2Vec embeddings
-                4. Index = (1 - average similarity) × 100
-                5. Higher index indicates citations from more diverse/different fields
+                        # Side by side comparison cards
+                        col1, col2 = st.columns(2)
 
-                **Interpretation:**
-                - **0-20%**: Focused research within specific domain
-                - **21-50%**: Moderate cross-disciplinary engagement
-                - **51-80%**: Significant interdisciplinary impact
-                - **81-100%**: Highly interdisciplinary work
-                """)
+                        with col1:
+                            st.markdown(f"""
+                            <div class="comparison-card">
+                                <h3>{author1['name']}</h3>
+                                <h1>{result1['author_index']:.1f}%</h1>
+                                <p>{get_category_emoji(result1['category'])} {result1['category']}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            st.metric("Max Index", f"{result1['max_index']:.1f}%")
+                            st.metric("Papers", len(result1['df']))
+
+                        with col2:
+                            st.markdown(f"""
+                            <div class="comparison-card-cyan">
+                                <h3>{author2['name']}</h3>
+                                <h1>{result2['author_index']:.1f}%</h1>
+                                <p>{get_category_emoji(result2['category'])} {result2['category']}</p>
+                            </div>
+                            """, unsafe_allow_html=True)
+                            st.metric("Max Index", f"{result2['max_index']:.1f}%")
+                            st.metric("Papers", len(result2['df']))
+
+                        # Comparison summary
+                        diff = abs(result1['author_index'] - result2['author_index'])
+                        more_interdisciplinary = author1['name'] if result1['author_index'] > result2['author_index'] else author2['name']
+                        st.info(f"**Difference:** {diff:.1f} percentage points | **More Interdisciplinary:** {more_interdisciplinary}")
+
+                        st.markdown("---")
+
+                        # Scatter plots side by side
+                        st.markdown("### Publication Timeline")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            result1['scatter'].update_layout(title=f"{author1['name']} - Index Over Time")
+                            st.plotly_chart(result1['scatter'], use_container_width=True)
+                        with col2:
+                            result2['scatter'].update_layout(title=f"{author2['name']} - Index Over Time")
+                            st.plotly_chart(result2['scatter'], use_container_width=True)
+
+                        # Field breakdown side by side
+                        st.markdown("### Citation Field Distribution")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if result1['field_chart']:
+                                result1['field_chart'].update_layout(title=f"{author1['name']} - Citing Fields")
+                                st.plotly_chart(result1['field_chart'], use_container_width=True)
+                        with col2:
+                            if result2['field_chart']:
+                                result2['field_chart'].update_layout(title=f"{author2['name']} - Citing Fields")
+                                st.plotly_chart(result2['field_chart'], use_container_width=True)
+
+                        # Keywords side by side
+                        st.markdown("### Top Keywords")
+                        col1, col2 = st.columns(2)
+                        with col1:
+                            if result1['keyword_chart']:
+                                result1['keyword_chart'].update_layout(title=f"{author1['name']} - Keywords")
+                                st.plotly_chart(result1['keyword_chart'], use_container_width=True)
+                        with col2:
+                            if result2['keyword_chart']:
+                                result2['keyword_chart'].update_layout(title=f"{author2['name']} - Keywords")
+                                st.plotly_chart(result2['keyword_chart'], use_container_width=True)
+
+    # ==================== TAB 3: ABOUT ====================
+    with tab3:
+        st.markdown("""
+        ## About the Interdisciplinary Index
+
+        This tool measures how **interdisciplinary** a researcher's work is by analyzing the semantic
+        similarity between their papers and the papers that cite them.
+
+        ### How It Works
+
+        1. **Fetch Top Papers**: Retrieves the author's top 10 most-cited papers from OpenAlex
+        2. **Analyze Citations**: For each paper, fetches 10 recent citing papers
+        3. **Compute Similarity**: Uses Model2Vec embeddings to calculate semantic similarity between original and citing abstracts
+        4. **Calculate Index**: Index = (1 - average similarity) × 100
+
+        ### Interpretation
+
+        | Index Range | Category | Meaning |
+        |-------------|----------|---------|
+        | 0-20% | 🟢 Low | Focused research within specific domain |
+        | 21-50% | 🟡 Moderate | Moderate cross-disciplinary engagement |
+        | 51-80% | 🟠 High | Significant interdisciplinary impact |
+        | 81-100% | 🔴 Very High | Highly interdisciplinary work |
+
+        ### Technology Stack
+
+        - **Data Source**: [OpenAlex](https://openalex.org/) - Open academic data
+        - **Embeddings**: [Model2Vec](https://github.com/MinishLab/model2vec) (minishlab/potion-base-32M)
+        - **Keywords**: [KeyBERT](https://github.com/MaartenGr/KeyBERT)
+        - **Frontend**: [Streamlit](https://streamlit.io/)
+
+        ### Limitations
+
+        - Only analyzes papers with abstracts available in OpenAlex
+        - Semantic similarity is an approximation of disciplinary distance
+        - Results depend on citation patterns which may have biases
+
+        ---
+
+        **Source Code**: [GitHub](https://github.com/alkat19/interdisciplinary-index-analyzer)
+        """)
 
 if __name__ == "__main__":
     main()
