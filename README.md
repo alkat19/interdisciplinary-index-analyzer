@@ -4,17 +4,18 @@ A web application that measures the cross-domain impact of academic research by 
 
 ## What It Does
 
-This tool calculates an **Interdisciplinary Index** for researchers by:
+This tool calculates a **Composite Interdisciplinary Score** for researchers using four metrics:
 
-1. Fetching the author's top 10 most-cited papers from OpenAlex
-2. For each paper, retrieving 10 recent citing papers
-3. Computing semantic similarity between original and citing abstracts using Model2Vec embeddings
-4. Index = (1 - average similarity) × 100
-5. Higher index indicates citations from more diverse/different fields
+| Metric | Weight | Description |
+|--------|--------|-------------|
+| **Citation Diversity** | 30% | Semantic distance between author's papers and citing papers |
+| **Cluster Dispersion** | 25% | How spread out research topics are (PCA + K-means) |
+| **Reference Diversity** | 25% | Variety of fields in references (Shannon entropy) |
+| **Bridge Score** | 20% | Fields that cite you but you don't cite back |
 
 ## Interpretation
 
-| Index Range | Category | Meaning |
+| Score Range | Category | Meaning |
 |-------------|----------|---------|
 | 0-20% | Low | Focused research within specific domain |
 | 21-50% | Moderate | Moderate cross-disciplinary engagement |
@@ -25,35 +26,43 @@ This tool calculates an **Interdisciplinary Index** for researchers by:
 
 - **Author Search**: Search for any researcher in OpenAlex database
 - **Disambiguation**: Select from multiple matching authors
-- **Visualizations**:
-  - Index by publication year (scatter plot)
-  - Similarity distribution (KDE plot)
-  - Citation fields breakdown (pie chart)
-  - Top keywords from citing papers (bar chart)
-- **Export**: Download results as CSV
+- **Top Papers Table**: Ranked by citation diversity score with scrollable view
+- **Visualizations** (8 interactive charts):
+  - Metrics Overview (bullet chart)
+  - Research Landscape (PCA scatter with clusters)
+  - Citation Diversity by Year
+  - Similarity Distribution (KDE)
+  - Fields Referenced
+  - Knowledge Flow (bridge analysis)
+  - Citing Fields Breakdown
+  - Top Keywords from citing papers
+- **Interactive HTML Export**: Download full report with all charts preserved
 - **Caching**: Session-based caching for faster repeated queries
 
 ## Tech Stack
 
-- **Frontend**: Streamlit
+- **Frontend**: Gradio
 - **Data Source**: OpenAlex API
 - **ML Model**: Model2Vec (minishlab/potion-base-32M)
-- **Keyword Extraction**: KeyBERT
+- **Clustering**: scikit-learn (PCA, K-means)
 - **Visualization**: Plotly
+- **Keyword Extraction**: KeyBERT
 
 ## Local Development
 
 ```bash
 # Clone the repo
-git clone https://github.com/YOUR_USERNAME/interdisciplinary-index-analyzer.git
+git clone https://github.com/alkat19/interdisciplinary-index-analyzer.git
 cd interdisciplinary-index-analyzer
 
 # Install dependencies
 pip install -r requirements.txt
 
 # Run the app
-streamlit run streamlit_app.py
+python app_inter_pro.py
 ```
+
+The app will launch at `http://localhost:7860`
 
 ## Acknowledgments
 
