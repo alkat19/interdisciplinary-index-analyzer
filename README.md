@@ -6,12 +6,51 @@ A web application that measures the cross-domain impact of academic research by 
 
 This tool calculates a **Composite Interdisciplinary Score** for researchers using four metrics:
 
-| Metric | Weight | Description |
-|--------|--------|-------------|
-| **Citation Diversity** | 30% | Semantic distance between author's papers and citing papers |
-| **Cluster Dispersion** | 25% | How spread out research topics are (PCA + K-means) |
-| **Reference Diversity** | 25% | Variety of fields in references (Shannon entropy) |
-| **Bridge Score** | 20% | Fields that cite you but you don't cite back |
+### 1. Citation Diversity (30%)
+
+**What it measures:** How different are the papers that cite your work from your own research?
+
+**How it works:**
+- Fetches your top 10 most-cited papers and their citing papers
+- Converts abstracts into numerical vectors using ML embeddings (Model2Vec)
+- Calculates cosine similarity between your papers and their citations
+- Lower similarity = higher diversity score
+
+**Example:** If a biology paper gets cited by economics and physics papers, those citations will have low semantic similarity to the original, resulting in a high diversity score.
+
+### 2. Cluster Dispersion (25%)
+
+**What it measures:** How spread out are your research topics?
+
+**How it works:**
+- Takes all paper embeddings and reduces them to 2D using PCA
+- Groups papers into clusters using K-means algorithm
+- Measures how far apart these clusters are from each other
+- More spread = higher dispersion score
+
+**Example:** A researcher working on both "machine learning" and "climate policy" would have distant clusters, indicating diverse research areas.
+
+### 3. Reference Diversity (25%)
+
+**What it measures:** How many different fields do you draw knowledge from?
+
+**How it works:**
+- Analyzes the academic fields of papers you reference
+- Calculates Shannon entropy across field distribution
+- More fields with balanced representation = higher score
+
+**Example:** If your references span Medicine (40%), Mathematics (30%), and Computer Science (30%), you'd score higher than someone citing only Medicine (100%).
+
+### 4. Bridge Score (20%)
+
+**What it measures:** Are you connecting fields that don't usually talk to each other?
+
+**How it works:**
+- Compares fields you cite vs. fields that cite you
+- Identifies "bridged" fields: those citing your work that you don't cite back
+- More bridged fields = higher bridge score
+
+**Example:** If you publish in Biology but get cited by Sociology researchers (whom you don't cite), you're bridging knowledge between disconnected fields.
 
 ## Interpretation
 
