@@ -1,0 +1,10 @@
+streamlit>=1.28.0
+httpx>=0.24.1
+pandas>=1.5.0
+plotly>=5.13.0
+torch>=1.12.0
+sentence-transformers>=2.2.2
+keybert>=0.7.0
+scipy>=1.9.3
+numpy>=1.23.0
+model2vec>=0.1.0
