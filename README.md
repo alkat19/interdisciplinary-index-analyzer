@@ -55,20 +55,6 @@ pip install -r requirements.txt
 streamlit run streamlit_app.py
 ```
 
-## Deployment
-
-This app is designed for deployment on [Streamlit Cloud](https://streamlit.io/cloud):
-
-1. Fork this repository
-2. Go to [share.streamlit.io](https://share.streamlit.io)
-3. Connect your GitHub account
-4. Select this repo and `streamlit_app.py` as the main file
-5. Deploy!
-
-## License
-
-MIT License
-
 ## Acknowledgments
 
 - [OpenAlex](https://openalex.org/) for the open academic data API
