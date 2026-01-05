@@ -6,7 +6,7 @@ A web application that measures the cross-domain impact of academic research by 
 
 This tool calculates a **Composite Interdisciplinary Score** for researchers using four metrics:
 
-### 1. Citation Diversity (30%)
+### 1. External Diversity (35%)
 
 **What it measures:** How different are the papers that cite your work from your own research?
 
@@ -18,19 +18,18 @@ This tool calculates a **Composite Interdisciplinary Score** for researchers usi
 
 **Example:** If a biology paper gets cited by economics and physics papers, those citations will have low semantic similarity to the original, resulting in a high diversity score.
 
-### 2. Cluster Dispersion (25%)
+### 2. Internal Diversity (25%)
 
 **What it measures:** How spread out are your research topics?
 
 **How it works:**
-- Takes all paper embeddings and reduces them to 2D using PCA
-- Groups papers into clusters using K-means algorithm
-- Measures how far apart these clusters are from each other
-- More spread = higher dispersion score
+- Takes all paper embeddings and computes pairwise cosine similarity
+- Measures how different your papers are from each other
+- Lower average similarity = higher dispersion score
 
-**Example:** A researcher working on both "machine learning" and "climate policy" would have distant clusters, indicating diverse research areas.
+**Example:** A researcher working on both "machine learning" and "climate policy" would have distant papers, indicating diverse research areas.
 
-### 3. Reference Diversity (25%)
+### 3. Reference Diversity (30%)
 
 **What it measures:** How many different fields do you draw knowledge from?
 
@@ -41,7 +40,7 @@ This tool calculates a **Composite Interdisciplinary Score** for researchers usi
 
 **Example:** If your references span Medicine (40%), Mathematics (30%), and Computer Science (30%), you'd score higher than someone citing only Medicine (100%).
 
-### 4. Bridge Score (20%)
+### 4. Bridge Score (10%)
 
 **What it measures:** Are you connecting fields that don't usually talk to each other?
 
@@ -65,15 +64,15 @@ This tool calculates a **Composite Interdisciplinary Score** for researchers usi
 
 - **Author Search**: Search for any researcher in OpenAlex database
 - **Disambiguation**: Select from multiple matching authors
-- **Top Papers Table**: Ranked by citation diversity score with scrollable view
+- **Top Papers Table**: Ranked by External Diversity score with scrollable view
 - **Visualizations** (8 interactive charts):
   - Metrics Overview (bullet chart)
-  - Research Landscape (PCA scatter with clusters)
-  - Citation Diversity by Year
+  - Paper Similarity Heatmap (pairwise cosine similarity matrix)
+  - External Diversity by Year (scatter plot)
   - Similarity Distribution (KDE)
-  - Fields Referenced
+  - Fields Referenced (bar chart)
   - Knowledge Flow (bridge analysis)
-  - Citing Fields Breakdown
+  - Citing Fields Breakdown (bar chart)
   - Top Keywords from citing papers
 - **Interactive HTML Export**: Download full report with all charts preserved
 - **Caching**: Session-based caching for faster repeated queries
@@ -83,7 +82,7 @@ This tool calculates a **Composite Interdisciplinary Score** for researchers usi
 - **Frontend**: Gradio
 - **Data Source**: OpenAlex API
 - **ML Model**: Model2Vec (minishlab/potion-base-32M)
-- **Clustering**: scikit-learn (PCA, K-means)
+- **Similarity**: scikit-learn (cosine similarity)
 - **Visualization**: Plotly
 - **Keyword Extraction**: KeyBERT
 
@@ -98,7 +97,7 @@ cd interdisciplinary-index-analyzer
 pip install -r requirements.txt
 
 # Run the app
-python app_inter_pro.py
+python app_inter_ultra.py
 ```
 
 The app will launch at `http://localhost:7860`

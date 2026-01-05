@@ -266,7 +266,8 @@ async def build_author_cache(
                         "year": entry["publication_year"],
                         "abstract_inverted_index": abstract,
                         "citation_count": entry.get("cited_by_count", 0),
-                        "primary_topic": primary_topic
+                        "primary_topic": primary_topic,
+                        "concepts": entry.get("concepts", [])  # Include concepts for co-occurrence analysis
                     })
 
             if len(papers) >= max_papers or not data.get("meta", {}).get("next_cursor"):
