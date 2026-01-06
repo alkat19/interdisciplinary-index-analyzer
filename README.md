@@ -11,30 +11,32 @@ This tool calculates a **Composite Interdisciplinary Score** for researchers usi
 **What it measures:** How different are the papers that cite your work from your own research?
 
 **How it works:**
-- Fetches your top 10 most-cited papers and their citing papers
-- Converts abstracts into numerical vectors using ML embeddings (Model2Vec)
-- Calculates cosine similarity between your papers and their citations
-- Lower similarity = higher diversity score
+- Fetches your top 10 most-cited papers
+- For each paper, retrieves the 50 most recent citing papers
+- Converts abstracts into numerical vectors using ML embeddings
+- Calculates cosine distance between your papers and their citations
+- Higher distance = higher diversity score
 
-**Example:** If a biology paper gets cited by economics and physics papers, those citations will have low semantic similarity to the original, resulting in a high diversity score.
+**Example:** If a biology paper gets cited by economics and physics papers, those citations will have high semantic distance from the original, resulting in a high diversity score.
 
 ### 2. Internal Diversity (25%)
 
 **What it measures:** How spread out are your research topics?
 
 **How it works:**
-- Takes all paper embeddings and computes pairwise cosine similarity
-- Measures how different your papers are from each other
-- Lower average similarity = higher dispersion score
+- Takes all 10 paper embeddings and computes pairwise cosine distance
+- Score = average pairwise distance × 100
+- Higher distance = papers cover more different topics
 
-**Example:** A researcher working on both "machine learning" and "climate policy" would have distant papers, indicating diverse research areas.
+**Example:** A researcher working on both "machine learning" and "climate policy" would have high distance between papers, indicating diverse research areas.
 
 ### 3. Reference Diversity (30%)
 
 **What it measures:** How many different fields do you draw knowledge from?
 
 **How it works:**
-- Analyzes the academic fields of papers you reference
+- For each of your 10 papers, analyzes up to 50 references
+- Extracts the academic field of each referenced paper
 - Calculates Shannon entropy across field distribution
 - More fields with balanced representation = higher score
 
@@ -45,11 +47,19 @@ This tool calculates a **Composite Interdisciplinary Score** for researchers usi
 **What it measures:** Are you connecting fields that don't usually talk to each other?
 
 **How it works:**
-- Compares fields you cite vs. fields that cite you
+- Compares fields you cite (50 refs per paper) vs. fields that cite you (50 most recent per paper)
 - Identifies "bridged" fields: those citing your work that you don't cite back
-- More bridged fields = higher bridge score
+- Bridge score = bridged fields / total unique fields × 100
 
 **Example:** If you publish in Biology but get cited by Sociology researchers (whom you don't cite), you're bridging knowledge between disconnected fields.
+
+## Analysis Scope
+
+| Parameter | Value |
+|-----------|-------|
+| Papers analyzed | Top 10 most-cited |
+| Citing papers per paper | 50 (most recent) |
+| References per paper | 50 |
 
 ## Interpretation
 
@@ -81,8 +91,8 @@ This tool calculates a **Composite Interdisciplinary Score** for researchers usi
 
 - **Frontend**: Gradio
 - **Data Source**: OpenAlex API
-- **ML Model**: Model2Vec (minishlab/potion-base-32M)
-- **Similarity**: scikit-learn (cosine similarity)
+- **ML Model**: Sentence Transformers (minishlab/potion-base-32M)
+- **Similarity**: scipy (cosine distance), scikit-learn (cosine similarity for heatmap)
 - **Visualization**: Plotly
 - **Keyword Extraction**: KeyBERT
 
@@ -97,7 +107,7 @@ cd interdisciplinary-index-analyzer
 pip install -r requirements.txt
 
 # Run the app
-python app_inter_ultra.py
+python interdisciplinary_app.py
 ```
 
 The app will launch at `http://localhost:7860`
@@ -105,5 +115,5 @@ The app will launch at `http://localhost:7860`
 ## Acknowledgments
 
 - [OpenAlex](https://openalex.org/) for the open academic data API
-- [Model2Vec](https://github.com/MinishLab/model2vec) for efficient embeddings
+- [Sentence Transformers](https://www.sbert.net/) for efficient embeddings
 - [KeyBERT](https://github.com/MaartenGr/KeyBERT) for keyword extraction
