@@ -30,6 +30,14 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # ============================================================================
+# EXCEPTIONS
+# ============================================================================
+
+class RateLimitExceeded(Exception):
+    """Raised when OpenAlex daily rate limit (100,000 requests) is hit."""
+    pass
+
+# ============================================================================
 # CACHE MANAGEMENT (Session-aware)
 # ============================================================================
 
@@ -106,9 +114,12 @@ async def fetch_with_retry(
     Fetch data from API with exponential backoff retry logic.
 
     Handles:
-    - Rate limiting (429)
+    - Rate limiting (429) with daily limit detection
     - Server errors (5xx)
     - Network errors
+
+    Raises:
+        RateLimitExceeded: When the daily 100,000 request limit is hit
     """
     for attempt in range(max_retries):
         try:
@@ -116,6 +127,20 @@ async def fetch_with_retry(
 
             # Handle rate limiting
             if r.status_code == 429:
+                # Check if this is the daily limit (not just per-second throttling)
+                try:
+                    error_data = r.json()
+                    error_message = error_data.get("message", "")
+                    if "100000 requests per day" in error_message:
+                        retry_after = error_data.get("retryAfter", "unknown")
+                        logger.error(f"Daily rate limit exceeded! Retry after: {retry_after}s")
+                        raise RateLimitExceeded(
+                            f"OpenAlex daily limit (100,000 requests) exceeded. "
+                            f"Please try again tomorrow or wait {retry_after} seconds."
+                        )
+                except (json.JSONDecodeError, KeyError):
+                    pass  # Not a JSON response, treat as regular rate limit
+
                 wait_time = RETRY_BACKOFF_BASE * (2 ** attempt)
                 logger.warning(f"Rate limited. Waiting {wait_time}s before retry {attempt + 1}/{max_retries}")
                 await asyncio.sleep(wait_time)
@@ -130,6 +155,9 @@ async def fetch_with_retry(
 
             r.raise_for_status()
             return r.json()
+
+        except RateLimitExceeded:
+            raise  # Don't catch this, let it bubble up
 
         except httpx.HTTPStatusError as e:
             logger.error(f"HTTP error {e.response.status_code} for {url}")

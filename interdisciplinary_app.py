@@ -32,7 +32,7 @@ import httpx
 from reproducible_cache import (
     is_cached, load_author_cache, build_author_cache, fetch_paper_by_id,
     get_cache_timestamp, clear_author_cache, fetch_with_retry,
-    OPENALEX_BASE_URL, HEADERS, REQUEST_TIMEOUT
+    OPENALEX_BASE_URL, HEADERS, REQUEST_TIMEOUT, RateLimitExceeded
 )
 
 # ============================================================================
@@ -173,17 +173,45 @@ def calculate_embedding_dispersion(abstracts: list[str]) -> dict:
 
     return {"dispersion_score": float(dispersion_score), "embeddings": embeddings_np}
 
-async def fetch_paper_references(paper_id: str, client: httpx.AsyncClient, limit: int = 50) -> list[dict]:
+async def fetch_reference_fields_batched(paper_id: str, client: httpx.AsyncClient, limit: int = 50) -> list[str]:
+    """Fetch fields for referenced works using batched API calls (50 works per batch).
+
+    This reduces API calls from ~50 per paper to ~2 per paper (98% reduction).
+    """
+    # First, get the list of referenced work IDs
     data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/works/{paper_id}", params={"select": "referenced_works"})
     if not data or not data.get("referenced_works"):
         return []
-    references = []
-    for ref_url in data["referenced_works"][:limit]:
-        ref_id = ref_url.split("/")[-1]
-        ref_data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/works/{ref_id}", params={"select": "id,title,primary_topic,concepts"})
-        if ref_data:
-            references.append(ref_data)
-    return references
+
+    # Extract work IDs from URLs
+    work_ids = [url.split("/")[-1] for url in data["referenced_works"][:limit]]
+    if not work_ids:
+        return []
+
+    # Batch fetch in groups of 50 (OpenAlex limit for filter)
+    fields = []
+    BATCH_SIZE = 50
+    for i in range(0, len(work_ids), BATCH_SIZE):
+        batch = work_ids[i:i + BATCH_SIZE]
+        ids_filter = "|".join(batch)
+
+        batch_data = await fetch_with_retry(
+            client,
+            f"{OPENALEX_BASE_URL}/works",
+            params={
+                "filter": f"openalex_id:{ids_filter}",
+                "select": "primary_topic,concepts",
+                "per_page": BATCH_SIZE
+            }
+        )
+
+        if batch_data and batch_data.get("results"):
+            for work in batch_data["results"]:
+                field = extract_field_from_paper(work)
+                if field != "Unknown":
+                    fields.append(field)
+
+    return fields
 
 def extract_field_from_paper(paper: dict) -> str:
     if paper.get("primary_topic"):
@@ -201,17 +229,32 @@ def extract_field_from_paper(paper: dict) -> str:
                 return concept["display_name"]
     return "Unknown"
 
-async def calculate_reference_diversity(author_id: str, papers: list[dict], client: httpx.AsyncClient) -> dict:
+async def calculate_reference_diversity(author_id: str, papers: list[dict], client: httpx.AsyncClient, progress_callback=None) -> dict:
     all_field_counts = defaultdict(int)
+
+    # Extract paper IDs
+    paper_ids = []
     for paper in papers[:Config.TOP_N_PAPERS]:
         paper_id = paper.get("id", "").split("/")[-1] if "/" in str(paper.get("id", "")) else paper.get("id", "")
-        if not paper_id:
+        if paper_id:
+            paper_ids.append(paper_id)
+
+    if not paper_ids:
+        return {"field_counts": {}, "entropy_score": 0, "diversity_index": 0, "unique_fields": 0}
+
+    # Fetch all papers' references in parallel
+    if progress_callback:
+        progress_callback(f"Fetching references for {len(paper_ids)} papers...")
+    tasks = [fetch_reference_fields_batched(pid, client, Config.REFERENCES_PER_PAPER) for pid in paper_ids]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    # Aggregate fields from all results
+    for i, fields in enumerate(results):
+        if isinstance(fields, Exception):
+            logger.warning(f"Error fetching references for paper {paper_ids[i]}: {fields}")
             continue
-        references = await fetch_paper_references(paper_id, client, Config.REFERENCES_PER_PAPER)
-        for ref in references:
-            field = extract_field_from_paper(ref)
-            if field != "Unknown":
-                all_field_counts[field] += 1
+        for field in fields:
+            all_field_counts[field] += 1
 
     if not all_field_counts:
         return {"field_counts": {}, "entropy_score": 0, "diversity_index": 0, "unique_fields": 0}
@@ -230,18 +273,48 @@ async def fetch_citing_paper_fields(paper_id: str, client: httpx.AsyncClient, li
         return []
     return [extract_field_from_paper(p) for p in data["results"] if extract_field_from_paper(p) != "Unknown"]
 
-async def calculate_bridge_score(author_id: str, papers: list[dict], client: httpx.AsyncClient) -> dict:
+async def calculate_bridge_score(author_id: str, papers: list[dict], client: httpx.AsyncClient, progress_callback=None) -> dict:
     source_field_counts, audience_field_counts = defaultdict(int), defaultdict(int)
 
+    # Extract paper IDs
+    paper_ids = []
     for paper in papers[:Config.TOP_N_PAPERS]:
         paper_id = paper.get("id", "").split("/")[-1] if "/" in str(paper.get("id", "")) else paper.get("id", "")
-        if not paper_id:
+        if paper_id:
+            paper_ids.append(paper_id)
+
+    if not paper_ids:
+        return {"source_fields": {}, "audience_fields": {}, "bridge_score": 0, "bridged_fields": [], "common_fields": []}
+
+    # Fetch source fields (references) and audience fields (citing papers) in parallel
+    if progress_callback:
+        progress_callback(f"Computing bridge score for {len(paper_ids)} papers...")
+
+    # Create tasks for both reference fields and citing fields
+    ref_tasks = [fetch_reference_fields_batched(pid, client, Config.REFERENCES_PER_PAPER) for pid in paper_ids]
+    cite_tasks = [fetch_citing_paper_fields(pid, client, Config.CITATIONS_PER_PAPER) for pid in paper_ids]
+
+    # Run all tasks in parallel
+    all_results = await asyncio.gather(*ref_tasks, *cite_tasks, return_exceptions=True)
+
+    # Split results back into ref and cite
+    ref_results = all_results[:len(paper_ids)]
+    cite_results = all_results[len(paper_ids):]
+
+    # Aggregate source fields from references
+    for i, fields in enumerate(ref_results):
+        if isinstance(fields, Exception):
+            logger.warning(f"Error fetching references for bridge score (paper {paper_ids[i]}): {fields}")
             continue
-        for ref in await fetch_paper_references(paper_id, client, Config.REFERENCES_PER_PAPER):
-            field = extract_field_from_paper(ref)
-            if field != "Unknown":
-                source_field_counts[field] += 1
-        for field in await fetch_citing_paper_fields(paper_id, client, Config.CITATIONS_PER_PAPER):
+        for field in fields:
+            source_field_counts[field] += 1
+
+    # Aggregate audience fields from citing papers
+    for i, fields in enumerate(cite_results):
+        if isinstance(fields, Exception):
+            logger.warning(f"Error fetching citing fields for bridge score (paper {paper_ids[i]}): {fields}")
+            continue
+        for field in fields:
             audience_field_counts[field] += 1
 
     if not source_field_counts or not audience_field_counts:
@@ -644,23 +717,29 @@ def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, comp
 # ============================================================================
 
 async def analyze_author(author_id: str, author_name: str, cache_dir: str = None):
+    logger.info(f"={'='*50}")
     logger.info(f"Starting analysis for: {author_name} ({author_id})")
     start_time = datetime.now()
 
+    # Step 1: Cache
     if not is_cached(author_id, cache_dir):
-        logger.info("Building cache (first time)...")
+        logger.info("[1/5] Building cache (first time - fetching papers and citations)...")
         await build_author_cache(author_id, top_n=Config.TOP_N_PAPERS, citations_per_paper=Config.CITATIONS_PER_PAPER, cache_dir=cache_dir)
+    else:
+        logger.info("[1/5] Loading from cache...")
 
-    logger.info("Loading data...")
     data = load_author_cache(author_id, cache_dir)
     top_papers = data["top_papers"]
+    logger.info(f"      Found {len(top_papers)} papers to analyze")
 
     results, all_keywords, similarities_all, all_citing_texts = [], [], [], []
 
     async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
+        # Step 2: External Diversity (per-paper citing abstracts)
         total = len(top_papers)
+        logger.info(f"[2/5] Computing External Diversity ({total} papers)...")
         for idx, paper in enumerate(top_papers):
-            logger.info(f"Analyzing paper {idx+1}/{total}...")
+            logger.info(f"      Paper {idx+1}/{total}: {paper['title'][:50]}...")
             abs_orig = reconstruct_abstract(paper.get("abstract_inverted_index"))
             if not abs_orig:
                 continue
@@ -671,13 +750,17 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
                 similarities_all.extend(sims)
                 all_citing_texts.extend(citing_texts)
 
-        logger.info("Analyzing reference diversity...")
-        ref_diversity = await calculate_reference_diversity(author_id, top_papers, client)
+        # Step 3: Reference Diversity (parallel batched)
+        logger.info(f"[3/5] Computing Reference Diversity (parallel fetch for {total} papers)...")
+        ref_diversity = await calculate_reference_diversity(author_id, top_papers, client, progress_callback=logger.info)
 
-        logger.info("Computing bridge score...")
-        bridge_data = await calculate_bridge_score(author_id, top_papers, client)
+        # Step 4: Bridge Score (parallel batched)
+        logger.info(f"[4/5] Computing Bridge Score (parallel fetch for {total} papers)...")
+        bridge_data = await calculate_bridge_score(author_id, top_papers, client, progress_callback=logger.info)
 
-    logger.info("Extracting keywords...")
+    # Step 5: Finalize (keywords, visualizations, report)
+    logger.info("[5/5] Finalizing analysis...")
+    logger.info("      Extracting keywords...")
     for text in all_citing_texts[:50]:
         try:
             kws = kw_model.extract_keywords(text, top_n=3, stop_words='english')
@@ -685,14 +768,14 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
         except:
             pass
 
-    logger.info("Creating visualizations...")
+    logger.info("      Creating visualizations...")
     df = pd.DataFrame(results).dropna().sort_values(by="paper_index", ascending=False).reset_index(drop=True)
     citation_index = df['paper_index'].mean() if not df.empty else 0
 
     sorted_abstracts = df['abstract'].tolist() if 'abstract' in df.columns else []
     sorted_titles = df['title'].tolist() if 'title' in df.columns else []
 
-    logger.info("Computing embedding dispersion...")
+    logger.info("      Computing Internal Diversity (embedding dispersion)...")
     dispersion_data = calculate_embedding_dispersion(sorted_abstracts)
 
     all_metrics = {
@@ -702,10 +785,10 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
         'bridge_score': bridge_data['bridge_score'],
     }
     composite_score = (
-        citation_index * 0.35 +
+        citation_index * 0.25 +
         dispersion_data['dispersion_score'] * 0.25 +
-        ref_diversity['diversity_index'] * 0.30 +
-        bridge_data['bridge_score'] * 0.10
+        ref_diversity['diversity_index'] * 0.25 +
+        bridge_data['bridge_score'] * 0.25
     )
 
     scatter = create_scatter_chart(df) if not df.empty else None
@@ -717,7 +800,7 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
     bullet_chart = create_metrics_summary_chart(all_metrics)
     keyword_chart = create_keywords_chart(Counter(all_keywords).most_common(10))
 
-    logger.info("Generating report...")
+    logger.info("      Generating report...")
     df_top_papers = df[["title", "year", "paper_index", "citation_count"]].copy()
     df_top_papers.insert(0, "Rank", range(1, len(df_top_papers) + 1))
     df_top_papers["paper_index"] = df_top_papers["paper_index"].round(1)
@@ -768,20 +851,24 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
 
     explanation = """### How It Works
 
-**Composite Score** is a weighted combination of four metrics:
+**Composite Score** is an equal-weighted average of four metrics:
 
 | Metric | Weight | Description |
 |--------|--------|-------------|
-| External Diversity | 35% | How different are papers that cite you from your own work |
+| External Diversity | 25% | How different are papers that cite you from your own work |
 | Internal Diversity | 25% | How spread out your research topics are |
-| Reference Diversity | 30% | Variety of fields you draw knowledge from |
-| Bridge Score | 10% | Fields that cite you but you don't cite back |
+| Reference Diversity | 25% | Variety of fields you draw knowledge from |
+| Bridge Score | 25% | Fields that cite you but you don't cite back |
 
 **Interpretation**: Low (0-20%) | Moderate (20-50%) | High (50-80%) | Very High (80-100%)
 """
 
     elapsed = (datetime.now() - start_time).total_seconds()
-    logger.info(f"Analysis completed in {elapsed:.1f}s")
+    logger.info(f"={'='*50}")
+    logger.info(f"Analysis completed for {author_name}")
+    logger.info(f"      Time: {elapsed:.1f}s | Composite Score: {composite_score:.1f}%")
+    logger.info(f"      Ext: {citation_index:.1f}% | Int: {dispersion_data['dispersion_score']:.1f}% | Ref: {ref_diversity['diversity_index']:.1f}% | Bridge: {bridge_data['bridge_score']:.1f}%")
+    logger.info(f"={'='*50}")
 
     return (df_report, results_html, bullet_chart, df_top_papers, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, keyword_chart, explanation, html_path)
 
@@ -1095,7 +1182,7 @@ A higher score indicates your work has broader impact across different fields, a
 
 ## The Four Metrics Explained
 
-### 1. External Diversity (35% of composite score)
+### 1. External Diversity (25% of composite score)
 
 **What it measures:** How different are the papers citing your work from your original papers?
 
@@ -1128,7 +1215,7 @@ A higher score indicates your work has broader impact across different fields, a
 
 ---
 
-### 3. Reference Diversity (30% of composite score)
+### 3. Reference Diversity (25% of composite score)
 
 **What it measures:** How many different academic fields do you draw knowledge from?
 
@@ -1142,7 +1229,7 @@ A higher score indicates your work has broader impact across different fields, a
 
 ---
 
-### 4. Bridge Score (10% of composite score)
+### 4. Bridge Score (25% of composite score)
 
 **What it measures:** Does your work connect fields that don't normally interact?
 
@@ -1158,12 +1245,17 @@ A higher score indicates your work has broader impact across different fields, a
 
 ## Understanding the Composite Score
 
-| Metric | Weight | Rationale |
+Each metric contributes equally (25%) to the composite score. This equal weighting approach is:
+- **Transparent** — no arbitrary decisions about which metric matters more
+- **Defensible** — each metric captures a distinct, complementary aspect of interdisciplinarity
+- **Simple** — easy to explain and interpret
+
+| Metric | Weight | What it captures |
 |--------|--------|-----------|
-| External Diversity | 35% | Strongest signal of real cross-field impact |
-| Reference Diversity | 30% | Shows breadth of intellectual inputs |
-| Internal Diversity | 25% | Demonstrates researcher versatility |
-| Bridge Score | 10% | Captures serendipitous cross-field connections |
+| External Diversity | 25% | Cross-field impact (who cites you) |
+| Reference Diversity | 25% | Intellectual breadth (who you cite) |
+| Internal Diversity | 25% | Research versatility (topic spread) |
+| Bridge Score | 25% | Novel connections (asymmetric flows) |
 
 **Score Interpretation:**
 
@@ -1198,7 +1290,7 @@ A higher score indicates your work has broader impact across different fields, a
 3. For each paper, retrieve up to 50 references (papers you cite)
 4. Compute neural embeddings using Sentence Transformers
 5. Analyze field distributions using OpenAlex's topic classification
-6. Calculate all four metrics and combine into weighted composite score
+6. Calculate all four metrics and combine into equal-weighted composite score
 
 **Limitations:**
 - Analyzes only top 10 papers (focuses on most impactful work)
@@ -1222,31 +1314,51 @@ A higher score indicates your work has broader impact across different fields, a
         def show_progress():
             return gr.update(value=create_progress_html("Analyzing"), visible=True)
 
+        def create_error_html(title: str, message: str) -> str:
+            return f"""<div class="results-card" style="border-color: #ef4444;">
+                <div style="text-align: center; padding: 32px;">
+                    <div style="font-size: 2rem; margin-bottom: 16px;">⚠️</div>
+                    <div style="font-size: 1.25rem; font-weight: 700; color: #111827; margin-bottom: 12px;">{title}</div>
+                    <div style="color: #6b7280;">{message}</div>
+                </div>
+            </div>"""
+
         async def run_analysis(author_id, cache_dir_val):
             if not author_id:
                 return [gr.update()] * 16
-            async with httpx.AsyncClient(timeout=30) as client:
-                data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/authors/{author_id}")
-                author_name = data.get("display_name", "Unknown") if data else "Unknown"
-            results = await analyze_author(author_id, author_name, cache_dir_val)
-            return [
-                gr.update(visible=False),
-                results[0],
-                gr.update(value=results[1], visible=True),
-                gr.update(value=results[2], visible=True),
-                gr.update(value=results[3], visible=True),
-                results[4],
-                results[5],
-                gr.update(value=results[6], visible=True),
-                results[7],
-                results[8],
-                results[9],
-                results[10],
-                gr.update(value=results[11], visible=True),
-                gr.update(value=results[12], visible=True),
-                gr.update(visible=True),
-                gr.update(visible=True),
-            ]
+            try:
+                async with httpx.AsyncClient(timeout=30) as client:
+                    data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/authors/{author_id}")
+                    author_name = data.get("display_name", "Unknown") if data else "Unknown"
+                results = await analyze_author(author_id, author_name, cache_dir_val)
+                return [
+                    gr.update(visible=False),
+                    results[0],
+                    gr.update(value=results[1], visible=True),
+                    gr.update(value=results[2], visible=True),
+                    gr.update(value=results[3], visible=True),
+                    results[4],
+                    results[5],
+                    gr.update(value=results[6], visible=True),
+                    results[7],
+                    results[8],
+                    results[9],
+                    results[10],
+                    gr.update(value=results[11], visible=True),
+                    gr.update(value=results[12], visible=True),
+                    gr.update(visible=True),
+                    gr.update(visible=True),
+                ]
+            except RateLimitExceeded as e:
+                error_html = create_error_html(
+                    "Daily Rate Limit Exceeded",
+                    f"OpenAlex's daily limit of 100,000 API requests has been reached. "
+                    f"Please try again tomorrow. Details: {str(e)}"
+                )
+                return [
+                    gr.update(value=error_html, visible=True),  # Show error in progress area
+                    *[gr.update()] * 15  # Keep other elements unchanged
+                ]
 
         search_btn.click(search_and_show_authors, [author_input], [author_dropdown, analyze_btn, selected_author_id])
         author_input.submit(search_and_show_authors, [author_input], [author_dropdown, analyze_btn, selected_author_id])
