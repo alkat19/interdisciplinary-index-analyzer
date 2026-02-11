@@ -134,7 +134,8 @@ async def search_authors(author_query: str, limit: int = 5) -> list[dict]:
             data = r.json()
             candidates = []
             for result in data.get("results", []):
-                institution = result.get("last_known_institution", {}).get("display_name", "") if result.get("last_known_institution") else ""
+                institutions = result.get("last_known_institutions") or []
+                institution = institutions[0].get("display_name", "") if institutions else ""
                 candidates.append({
                     "id": result["id"].split("/")[-1],
                     "name": result["display_name"],
@@ -273,8 +274,8 @@ async def fetch_citing_paper_fields(paper_id: str, client: httpx.AsyncClient, li
         return []
     return [extract_field_from_paper(p) for p in data["results"] if extract_field_from_paper(p) != "Unknown"]
 
-async def calculate_bridge_score(author_id: str, papers: list[dict], client: httpx.AsyncClient, progress_callback=None) -> dict:
-    source_field_counts, audience_field_counts = defaultdict(int), defaultdict(int)
+async def calculate_bridge_score(author_id: str, papers: list[dict], client: httpx.AsyncClient, progress_callback=None, source_field_counts: dict | None = None) -> dict:
+    audience_field_counts = defaultdict(int)
 
     # Extract paper IDs
     paper_ids = []
@@ -286,30 +287,27 @@ async def calculate_bridge_score(author_id: str, papers: list[dict], client: htt
     if not paper_ids:
         return {"source_fields": {}, "audience_fields": {}, "bridge_score": 0, "bridged_fields": [], "common_fields": []}
 
-    # Fetch source fields (references) and audience fields (citing papers) in parallel
+    # Reuse source fields from reference diversity if provided, otherwise fetch
+    if source_field_counts is None:
+        if progress_callback:
+            progress_callback(f"Fetching reference fields for {len(paper_ids)} papers...")
+        ref_tasks = [fetch_reference_fields_batched(pid, client, Config.REFERENCES_PER_PAPER) for pid in paper_ids]
+        ref_results = await asyncio.gather(*ref_tasks, return_exceptions=True)
+        source_field_counts = defaultdict(int)
+        for i, fields in enumerate(ref_results):
+            if isinstance(fields, Exception):
+                logger.warning(f"Error fetching references for bridge score (paper {paper_ids[i]}): {fields}")
+                continue
+            for field in fields:
+                source_field_counts[field] += 1
+        source_field_counts = dict(source_field_counts)
+
+    # Fetch audience fields (citing papers)
     if progress_callback:
-        progress_callback(f"Computing bridge score for {len(paper_ids)} papers...")
-
-    # Create tasks for both reference fields and citing fields
-    ref_tasks = [fetch_reference_fields_batched(pid, client, Config.REFERENCES_PER_PAPER) for pid in paper_ids]
+        progress_callback(f"Fetching citing fields for {len(paper_ids)} papers...")
     cite_tasks = [fetch_citing_paper_fields(pid, client, Config.CITATIONS_PER_PAPER) for pid in paper_ids]
+    cite_results = await asyncio.gather(*cite_tasks, return_exceptions=True)
 
-    # Run all tasks in parallel
-    all_results = await asyncio.gather(*ref_tasks, *cite_tasks, return_exceptions=True)
-
-    # Split results back into ref and cite
-    ref_results = all_results[:len(paper_ids)]
-    cite_results = all_results[len(paper_ids):]
-
-    # Aggregate source fields from references
-    for i, fields in enumerate(ref_results):
-        if isinstance(fields, Exception):
-            logger.warning(f"Error fetching references for bridge score (paper {paper_ids[i]}): {fields}")
-            continue
-        for field in fields:
-            source_field_counts[field] += 1
-
-    # Aggregate audience fields from citing papers
     for i, fields in enumerate(cite_results):
         if isinstance(fields, Exception):
             logger.warning(f"Error fetching citing fields for bridge score (paper {paper_ids[i]}): {fields}")
@@ -754,9 +752,9 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
         logger.info(f"[3/5] Computing Reference Diversity (parallel fetch for {total} papers)...")
         ref_diversity = await calculate_reference_diversity(author_id, top_papers, client, progress_callback=logger.info)
 
-        # Step 4: Bridge Score (parallel batched)
-        logger.info(f"[4/5] Computing Bridge Score (parallel fetch for {total} papers)...")
-        bridge_data = await calculate_bridge_score(author_id, top_papers, client, progress_callback=logger.info)
+        # Step 4: Bridge Score (reuses reference fields from step 3)
+        logger.info(f"[4/5] Computing Bridge Score for {total} papers...")
+        bridge_data = await calculate_bridge_score(author_id, top_papers, client, progress_callback=logger.info, source_field_counts=ref_diversity["field_counts"])
 
     # Step 5: Finalize (keywords, visualizations, report)
     logger.info("[5/5] Finalizing analysis...")
@@ -853,14 +851,25 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
 
 **Composite Score** is an equal-weighted average of four metrics:
 
-| Metric | Weight | Description |
-|--------|--------|-------------|
-| External Diversity | 25% | How different are papers that cite you from your own work |
-| Internal Diversity | 25% | How spread out your research topics are |
-| Reference Diversity | 25% | Variety of fields you draw knowledge from |
-| Bridge Score | 25% | Fields that cite you but you don't cite back |
-
-**Interpretation**: Low (0-20%) | Moderate (20-50%) | High (50-80%) | Very High (80-100%)
+<div style="display: flex; gap: 32px; flex-wrap: wrap; margin: 16px 0; align-items: flex-start;">
+<div style="flex: 1; min-width: 320px;">
+<table style="width: 100%; border-collapse: collapse;">
+<thead><tr style="background: #111827;"><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Metric</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Weight</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Description</th></tr></thead>
+<tbody>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">External Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">How different are papers that cite you from your own work</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Internal Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">How spread out your research topics are</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Reference Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Variety of fields you draw knowledge from</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Bridge Score</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Fields that cite you but you don't cite back</td></tr>
+</tbody></table>
+</div>
+<div style="flex: 0 0 auto; min-width: 200px; padding: 16px 20px; background: #F9FAFB; border-radius: 12px; border: 1px solid #E5E7EB;">
+<p style="font-weight: 700; margin-bottom: 10px; font-size: 0.85rem; text-transform: uppercase; color: #374151; letter-spacing: 0.3px;">Interpretation</p>
+<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">0-20%</span> &mdash; Low</p>
+<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">20-50%</span> &mdash; Moderate</p>
+<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">50-80%</span> &mdash; High</p>
+<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">80-100%</span> &mdash; Very High</p>
+</div>
+</div>
 """
 
     elapsed = (datetime.now() - start_time).total_seconds()
@@ -890,7 +899,7 @@ custom_css = """
 }
 
 .gradio-container {
-    max-width: 1400px !important;
+    max-width: 100% !important;
     font-family: 'Zen Kaku Gothic New', -apple-system, BlinkMacSystemFont, sans-serif !important;
     -webkit-font-smoothing: antialiased;
 }
@@ -1250,21 +1259,30 @@ Each metric contributes equally (25%) to the composite score. This equal weighti
 - **Defensible** — each metric captures a distinct, complementary aspect of interdisciplinarity
 - **Simple** — easy to explain and interpret
 
-| Metric | Weight | What it captures |
-|--------|--------|-----------|
-| External Diversity | 25% | Cross-field impact (who cites you) |
-| Reference Diversity | 25% | Intellectual breadth (who you cite) |
-| Internal Diversity | 25% | Research versatility (topic spread) |
-| Bridge Score | 25% | Novel connections (asymmetric flows) |
-
-**Score Interpretation:**
-
-| Range | Category | What it means |
-|-------|----------|---------------|
-| 0-20% | Low | Highly focused within one discipline |
-| 20-50% | Moderate | Some cross-field activity |
-| 50-80% | High | Significant interdisciplinary impact |
-| 80-100% | Very High | Exceptional boundary-crossing research |
+<div style="display: flex; gap: 32px; flex-wrap: wrap; margin: 24px 0; align-items: flex-start;">
+<div style="flex: 1; min-width: 300px;">
+<p style="font-weight: 700; margin-bottom: 8px;">Metric Weights:</p>
+<table style="width: 100%; border-collapse: collapse;">
+<thead><tr style="background: #111827;"><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Metric</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Weight</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">What it captures</th></tr></thead>
+<tbody>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">External Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Cross-field impact (who cites you)</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Reference Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Intellectual breadth (who you cite)</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Internal Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Research versatility (topic spread)</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Bridge Score</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Novel connections (asymmetric flows)</td></tr>
+</tbody></table>
+</div>
+<div style="flex: 1; min-width: 300px;">
+<p style="font-weight: 700; margin-bottom: 8px;">Score Interpretation:</p>
+<table style="width: 100%; border-collapse: collapse;">
+<thead><tr style="background: #111827;"><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Range</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Category</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">What it means</th></tr></thead>
+<tbody>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">0-20%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Low</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Highly focused within one discipline</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">20-50%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Moderate</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Some cross-field activity</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">50-80%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">High</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Significant interdisciplinary impact</td></tr>
+<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">80-100%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Very High</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Exceptional boundary-crossing research</td></tr>
+</tbody></table>
+</div>
+</div>
 
 ---
 
@@ -1305,7 +1323,7 @@ Each metric contributes equally (25%) to the composite score. This equal weighti
             candidates = await search_authors(query, limit=5)
             if not candidates:
                 return gr.update(choices=[], visible=False), gr.update(visible=False), ""
-            choices = [(f"{c['name']} ({c['institution']}) - {c['works_count']} works" if c['institution'] else f"{c['name']} - {c['works_count']} works", c['id']) for c in candidates]
+            choices = [(f"{c['name']} ({c['institution']}) - {c['works_count']} works, {c['cited_by_count']:,} citations" if c['institution'] else f"{c['name']} - {c['works_count']} works, {c['cited_by_count']:,} citations", c['id']) for c in candidates]
             return gr.update(choices=choices, value=choices[0][1], visible=True), gr.update(visible=True), candidates[0]['id']
 
         def create_progress_html(message: str) -> str:
