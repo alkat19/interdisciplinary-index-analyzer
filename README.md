@@ -1,6 +1,4 @@
-<img src="brand/ii-hex.svg" align="right" width="132" alt="Interdisciplinary Index">
-
-# Interdisciplinary Index
+# Interdisciplinary Index <img src="brand/ii-hex.svg" alt="Interdisciplinary Index" align="right" height="139" />
 
 Some research stays inside one field. Some of it draws on several, or gets picked up
 by people the author never reads. This measures that, for any researcher in
@@ -8,8 +6,6 @@ by people the author never reads. This measures that, for any researcher in
 
 Four numbers, computed from a researcher's 25 most-cited papers, plus the charts
 behind them and a check on whether the profile describes one person at all.
-
-<br clear="right">
 
 ---
 
