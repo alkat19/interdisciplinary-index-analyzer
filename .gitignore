@@ -46,3 +46,6 @@ cache/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Claude Code local config
+.claude/

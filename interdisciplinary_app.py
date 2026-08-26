@@ -1,11 +1,11 @@
 # interdisciplinary_app.py
 """
-Interdisciplinary Index Analyzer
+Interdisciplinary Index
 
 Measures the cross-domain impact of academic research using 4 complementary metrics:
 - External Diversity, Internal Diversity, Reference Diversity, and Bridge Score.
 
-Analyzes top 10 most-cited papers for interdisciplinarity analysis.
+Analyses an author's 25 most-cited papers.
 """
 
 import gradio as gr
@@ -16,7 +16,9 @@ import plotly.graph_objects as go
 import numpy as np
 import torch
 import logging
-import json
+import re
+import unicodedata
+import urllib.parse
 from datetime import datetime
 from sentence_transformers import SentenceTransformer, util
 from keybert import KeyBERT
@@ -30,9 +32,11 @@ import uuid
 import shutil
 import httpx
 from reproducible_cache import (
-    is_cached, load_author_cache, build_author_cache, fetch_paper_by_id,
+    is_cached, load_author_cache, build_author_cache,
     get_cache_timestamp, clear_author_cache, fetch_with_retry,
-    OPENALEX_BASE_URL, HEADERS, REQUEST_TIMEOUT, RateLimitExceeded
+    reconstruct_abstract, fetch_author_signals, CACHE_SCHEMA,
+    verify_api_key, log_api_key_status,
+    OPENALEX_BASE_URL, RateLimitExceeded, NotEnoughData, Throttled, InvalidAPIKey
 )
 
 # ============================================================================
@@ -42,24 +46,28 @@ from reproducible_cache import (
 class Config:
     MODEL_NAME = 'minishlab/potion-base-32M'
     DEVICE = "cpu"
-    TOP_N_PAPERS = 10
+    # 10 was too few: the bridge score fell 28-38% between 10 and 40 papers,
+    # because a longer reference list leaves less of the audience unexplained.
+    # External, internal and reference diversity were stable across that range.
+    TOP_N_PAPERS = 25
+    # 20 -> 100 citing works moves external diversity by 0.6 points, so 50 is
+    # comfortably past the point where more would buy anything.
     CITATIONS_PER_PAPER = 50
     REFERENCES_PER_PAPER = 50
-    MAX_PAPERS_FETCH = 2000
-    INDEX_THRESHOLDS = {"low": 20, "moderate": 50, "high": 80}
     KDE_BANDWIDTH = 0.2
-    MAX_CONCURRENT_REQUESTS = 5
     REQUEST_TIMEOUT = 30
 
-    COLORS = {
-        "primary": "#000000",
-        "secondary": "#374151",
-        "accent": "#6B7280",
-        "success": "#000000",
-        "warning": "#000000",
-        "gradient_start": "#000000",
-        "gradient_end": "#374151",
-    }
+    SEED = 42
+    EXCLUDE_SELF_CITATIONS = True
+
+    # Level of OpenAlex's topic hierarchy used as "field".
+    # subfield ~252 buckets, field ~26, domain 4. Falls back up the chain.
+    FIELD_LEVELS = ("subfield", "field", "domain")
+    FIELD_LEVEL = "field"
+
+    # Bridge score: a field is named as bridged once the citing work it sends
+    # exceeds the author's own citing of it by this share of the total.
+    BRIDGE_MIN_SHARE = 0.02
 
 # ============================================================================
 # LOGGING & MODEL SETUP
@@ -77,9 +85,12 @@ logger.info("Models loaded successfully")
 # CACHE MANAGEMENT
 # ============================================================================
 
+SESSION_DIR_PREFIX = "interdisciplinary_"
+
+
 def create_session_cache_dir() -> str:
     session_id = str(uuid.uuid4())[:8]
-    cache_dir = os.path.join(tempfile.gettempdir(), f"interdisciplinary_{session_id}")
+    cache_dir = os.path.join(tempfile.gettempdir(), f"{SESSION_DIR_PREFIX}{session_id}")
     os.makedirs(cache_dir, exist_ok=True)
     return cache_dir
 
@@ -90,73 +101,418 @@ def cleanup_session_cache(cache_dir: str):
         except Exception as e:
             logger.warning(f"Cleanup failed: {e}")
 
+
+def sweep_stale_session_caches(max_age_hours: float = 24.0) -> int:
+    """Remove session cache directories left behind by earlier runs.
+
+    Gradio's unload hook takes no arguments, so it cannot be told which session
+    directory to remove. Sweeping by age at startup is the reliable alternative:
+    only directories this app created, and only ones untouched for a day.
+    """
+    root = tempfile.gettempdir()
+    cutoff = datetime.now().timestamp() - max_age_hours * 3600
+    removed = 0
+    try:
+        entries = os.listdir(root)
+    except OSError:
+        return 0
+    for name in entries:
+        if not name.startswith(SESSION_DIR_PREFIX):
+            continue
+        path = os.path.join(root, name)
+        try:
+            if os.path.isdir(path) and os.path.getmtime(path) < cutoff:
+                shutil.rmtree(path)
+                removed += 1
+        except OSError as e:
+            logger.warning(f"Could not remove stale cache {name}: {e}")
+    if removed:
+        logger.info(f"Removed {removed} stale session cache director{'y' if removed == 1 else 'ies'}")
+    return removed
+
 # ============================================================================
 # UTILITY FUNCTIONS
 # ============================================================================
 
-def categorize_index(pct: float) -> str:
-    if pct <= Config.INDEX_THRESHOLDS["low"]:
-        return "Low"
-    elif pct <= Config.INDEX_THRESHOLDS["moderate"]:
-        return "Moderate"
-    elif pct <= Config.INDEX_THRESHOLDS["high"]:
-        return "High"
-    return "Very High"
+def progress_block(fraction: float, message: str) -> str:
+    """A progress bar rendered in the app's own styling.
 
-def reconstruct_abstract(inverted_index: dict | None) -> str | None:
-    if not inverted_index:
-        return None
-    try:
-        indices = [idx for val in inverted_index.values() for idx in val]
-        if not indices:
-            return None
-        max_idx = min(max(indices), 10000)
-        abstract = [""] * (max_idx + 1)
-        for word, positions in inverted_index.items():
-            for pos in positions:
-                if 0 <= pos < len(abstract):
-                    abstract[pos] = word
-        result = " ".join(filter(None, abstract))
-        return result if result.strip() else None
-    except Exception as e:
-        logger.error(f"Abstract reconstruction error: {e}")
-        return None
+    Gradio draws its own indicator on every output component of an event, which
+    is why a search showed two of them, and its bar reports elapsed seconds
+    rather than the step. Yielding this from the handler puts both the
+    appearance and the wording under the app's control.
+    """
+    pct = max(0.0, min(1.0, fraction)) * 100
+    return (
+        '<div class="progress-box">'
+        '<div class="progress-spinner"></div>'
+        '<div class="progress-body">'
+        f'<div class="progress-text">{message}</div>'
+        f'<div class="progress-rail"><div class="progress-fill" style="width:{pct:.0f}%"></div></div>'
+        '</div></div>'
+    )
 
-async def search_authors(author_query: str, limit: int = 5) -> list[dict]:
+
+def notice(title: str, body: str, kind: str = "info") -> str:
+    """A single inline message block — used for empty states and failures alike."""
+    return f'<div class="notice notice-{kind}"><b>{title}.</b> {body}</div>'
+
+
+
+def _normalise_author_query(q: str) -> tuple[str, str]:
+    """Accept a bare name, an ORCID, or an OpenAlex author ID.
+
+    Returns (mode, value) where mode is 'orcid', 'id', or 'search'.
+    """
+    q = q.strip()
+    bare = q.rsplit("/", 1)[-1].upper()
+    if bare.startswith("A") and bare[1:].isdigit():
+        return "id", bare
+    digits = q.replace("-", "").replace(" ", "")
+    tail = digits.rsplit("/", 1)[-1]
+    if len(tail) == 16 and tail[:15].isdigit() and (tail[15].isdigit() or tail[15] == "X"):
+        canonical = "-".join(tail[i:i + 4] for i in range(0, 16, 4))
+        return "orcid", canonical
+    return "search", q
+
+
+def _candidate_from_result(result: dict) -> dict:
+    institutions = result.get("last_known_institutions") or []
+    institution = institutions[0].get("display_name", "") if institutions else ""
+
+    years = [c.get("year") for c in (result.get("counts_by_year") or []) if c.get("year")]
+    span = f"{min(years)}–{max(years)}" if years else ""
+
+    topics = ", ".join(
+        t.get("display_name", "") for t in (result.get("topics") or [])[:2] if t.get("display_name")
+    )
+
+    orcid = result.get("orcid") or ""
+    if orcid:
+        orcid = orcid.rsplit("/", 1)[-1]
+
+    return {
+        "id": result["id"].split("/")[-1],
+        "name": result.get("display_name") or "Unknown",
+        "works_count": result.get("works_count", 0),
+        "cited_by_count": result.get("cited_by_count", 0),
+        "institution": institution,
+        "orcid": orcid,
+        "span": span,
+        "topics": topics,
+    }
+
+
+async def search_authors(author_query: str, limit: int = 6) -> list[dict]:
+    """Find candidate authors. Accepts a name, an ORCID, or an OpenAlex ID."""
+    mode, value = _normalise_author_query(author_query)
+    select = ("id,display_name,orcid,works_count,cited_by_count,"
+              "last_known_institutions,counts_by_year,topics")
+
     async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
-        try:
-            r = await client.get(
-                f"{OPENALEX_BASE_URL}/authors",
-                params={"search": author_query, "per_page": limit},
-                headers=HEADERS
-            )
-            r.raise_for_status()
-            data = r.json()
-            candidates = []
-            for result in data.get("results", []):
-                institutions = result.get("last_known_institutions") or []
-                institution = institutions[0].get("display_name", "") if institutions else ""
-                candidates.append({
-                    "id": result["id"].split("/")[-1],
-                    "name": result["display_name"],
-                    "works_count": result.get("works_count", 0),
-                    "cited_by_count": result.get("cited_by_count", 0),
-                    "institution": institution,
-                })
-            return candidates
-        except Exception as e:
-            logger.error(f"Author search error: {e}")
-            return []
+        if mode in ("orcid", "id"):
+            path = f"orcid:{value}" if mode == "orcid" else value
+            data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/authors/{path}",
+                                          params={"select": select})
+            return [_candidate_from_result(data)] if data and data.get("id") else []
+
+        data = await fetch_with_retry(
+            client, f"{OPENALEX_BASE_URL}/authors",
+            params={"search": value, "per_page": limit, "select": select},
+        )
+        return [_candidate_from_result(r) for r in (data or {}).get("results", []) if r.get("id")]
+
+
+# ============================================================================
+# PROFILE COHERENCE
+# ============================================================================
+# A merged author record raises all four diversity measures at once, so the
+# composite peaks exactly when the data are least trustworthy. These checks are
+# the only thing standing between that and a confident-looking number.
+#
+# Thresholds are tuned for recall, not precision: this warns a real person, so
+# a false accusation costs more than a missed one. A single signal is never
+# enough — only conflicting ORCIDs, which are close to proof, warn on their own.
+
+COHERENCE_LIMITS = {
+    "repeat_rate": 0.20,      # measured: ~32% median for a clean random draw
+    "institutions": 35,       # measured: 11-29 for clean records, 61+ when merged
+    "career_span": 60,        # years; longer than a plausible single career
+    "community_overlap": 0.05,  # Jaccard between two field communities
+    "community_share": 0.20,  # each community must hold this share of the work
+}
+
+
+NAME_SUFFIXES = {"jr", "sr", "ii", "iii", "iv"}
+
+# Letters that carry no combining mark, so NFKD leaves them alone, but which
+# are the same letter for name-matching purposes. Without this, "Abhışhek" and
+# "Abhishek" read as two people — and getting that wrong would flag
+# non-Anglophone researchers far more often than anyone else.
+_LETTER_FOLD = str.maketrans({
+    "ı": "i", "ł": "l", "ø": "o", "đ": "d", "ð": "d",
+    "þ": "th", "ß": "ss", "æ": "ae", "œ": "oe", "ħ": "h", "ŧ": "t",
+})
+
+
+def _fold_name(text: str) -> str:
+    """Lowercase, strip diacritics, and fold look-alike letters to ASCII."""
+    lowered = (text or "").lower().translate(_LETTER_FOLD)
+    decomposed = unicodedata.normalize("NFKD", lowered)
+    return "".join(c for c in decomposed if not unicodedata.combining(c))
+
+
+def _name_identities(raw_names: list[str]) -> list[str]:
+    """How many distinct people the bylines on a record appear to name.
+
+    Byline order is not stable — the same person appears as "Yoshua Bengio" and
+    as "Bengio, Yoshua" — so this compares unordered token sets rather than
+    assuming a position. Initials are absorbed into full names, including the
+    run-together form ("Harrell FE" alongside "Frank E. Harrell"). Multi-letter
+    given names are never treated as abbreviations of one another: "Yan" is not
+    read as short for "Yang", because collapsing those would erase exactly the
+    collision this is looking for.
+    """
+    entries = []
+    for name in raw_names:
+        tokens = frozenset(
+            t for t in re.sub(r"[^a-z\s]", " ", _fold_name(name)).split()
+            if t not in NAME_SUFFIXES
+        )
+        if tokens:
+            entries.append((tokens, (name or "").strip()))
+    if not entries:
+        return []
+
+    def compatible(a: frozenset, b: frozenset) -> bool:
+        small, large = (a, b) if len(a) <= len(b) else (b, a)
+        for tok in small:
+            if tok in large:
+                continue
+            if len(tok) == 1 and any(t.startswith(tok) for t in large):
+                continue
+            if any(len(t) == 1 and tok.startswith(t) for t in large):
+                continue
+            # run-together initials: "fe" standing for {frank, e}
+            if len(tok) <= 3 and all(any(t.startswith(ch) for t in large) for ch in tok):
+                continue
+            return False
+        return True
+
+    clusters: list[list[tuple]] = []
+    for sig, original in entries:
+        for cluster in clusters:
+            if any(compatible(sig, member_sig) for member_sig, _ in cluster):
+                cluster.append((sig, original))
+                break
+        else:
+            clusters.append([(sig, original)])
+
+    # label each cluster with its most complete spelling
+    return [max((o for _, o in c), key=len) for c in clusters]
+
+
+def _split_communities(signals: dict) -> tuple[float | None, tuple[str, str] | None]:
+    """Co-author overlap between the author's two largest field communities.
+
+    This is what separates genuine breadth from a name collision. A real
+    polymath carries a recurring core of collaborators across fields; two
+    different people who happen to share a name do not. Without it, wide-ranging
+    work would look suspicious purely for being wide-ranging.
+    """
+    field_works = signals.get("field_works") or {}
+    field_coauthors = signals.get("field_coauthors") or {}
+    total = signals.get("works_sampled") or 0
+    if total < 10 or len(field_works) < 2:
+        return None, None
+
+    ranked = sorted(field_works.items(), key=lambda x: x[1], reverse=True)[:2]
+    (f_a, n_a), (f_b, n_b) = ranked
+    if min(n_a, n_b) / total < COHERENCE_LIMITS["community_share"]:
+        return None, None
+
+    a = set(field_coauthors.get(f_a) or [])
+    b = set(field_coauthors.get(f_b) or [])
+    if not a or not b:
+        return None, None
+    return len(a & b) / len(a | b), (f_a, f_b)
+
+
+def assess_coherence(signals: dict) -> dict:
+    """Judge whether an OpenAlex author record plausibly describes one person.
+
+    Signals are split by how much weight they can carry alone. Sparse
+    co-authorship and institutional sprawl are *primary*: they are hard to
+    produce accidentally. Name variation, disjoint field communities, and an
+    implausible career span are *corroborating* — each has honest explanations
+    (romanisation, a methodologist serving several applied fields, a long
+    career), so none of them raises a warning without a primary signal beside
+    it. Conflicting ORCIDs are close to proof and stand alone.
+    """
+    if not signals or not signals.get("works_sampled"):
+        return {"verdict": "unknown", "flags": [], "stats": {}}
+
+    lim = COHERENCE_LIMITS
+    primary, corroborating = [], []
+
+    n_co = signals.get("n_coauthors") or 0
+    repeat_rate = (signals.get("n_repeat_coauthors") or 0) / n_co if n_co else None
+    if repeat_rate is not None and n_co >= 20 and repeat_rate < lim["repeat_rate"]:
+        primary.append(f"only {repeat_rate:.0%} of {n_co} co-authors appear on more than one paper")
+
+    if (signals.get("n_institutions") or 0) > lim["institutions"]:
+        primary.append(f"{signals['n_institutions']} different institutions across the work")
+
+    names = _name_identities(signals.get("raw_names") or [])
+    if len(names) > 1:
+        # Two clusters can share their longest spelling; listing it twice reads
+        # as a bug, so only distinct spellings are shown.
+        distinct = list(dict.fromkeys(names))
+        detail = f" ({'; '.join(distinct[:3])})" if len(distinct) > 1 else ""
+        corroborating.append(
+            f"bylines naming {len(names)} different people{detail}")
+
+    y0, y1 = signals.get("year_min"), signals.get("year_max")
+    if y0 and y1 and (y1 - y0) > lim["career_span"]:
+        corroborating.append(f"publications spanning {y1 - y0} years ({y0}\u2013{y1})")
+
+    overlap, pair = _split_communities(signals)
+    if overlap is not None and overlap < lim["community_overlap"]:
+        corroborating.append(
+            f"its {pair[0]} and {pair[1]} work share almost no co-authors "
+            f"({overlap:.0%} overlap)"
+        )
+
+    stats = {"repeat_rate": repeat_rate, "names": names, "community_overlap": overlap}
+    orcids = signals.get("orcids") or []
+    if len(orcids) > 1:
+        return {"verdict": "conflated", "flags": primary + corroborating,
+                "orcid_conflict": orcids, "stats": stats}
+
+    flagged = len(primary) >= 2 or (len(primary) >= 1 and len(corroborating) >= 1)
+    return {"verdict": "check" if flagged else "ok",
+            "flags": (primary + corroborating) if flagged else [],
+            "stats": stats}
+
+
+def coherence_notice(assessment: dict) -> str:
+    """Render a coherence warning, or nothing when the record looks sound."""
+    verdict = assessment.get("verdict")
+    if verdict in ("ok", "unknown"):
+        return ""
+
+    items = "".join(f"<li>{f}</li>" for f in assessment.get("flags", []))
+
+    if verdict == "conflated":
+        orcids = ", ".join(assessment.get("orcid_conflict", []))
+        body = (
+            "Two different ORCIDs appear on work filed under this single OpenAlex "
+            f"record ({orcids}), which means it holds more than one person's papers. "
+            "Every measure below is inflated by that: unrelated papers look like "
+            "range. Treat these numbers as unusable and pick a narrower profile."
+        )
+    else:
+        body = (
+            "This OpenAlex record may hold more than one person's work. Merged "
+            "records raise all four measures at once, because papers by different "
+            "people read as unusual range. Worth checking the affiliation and dates "
+            "before relying on the numbers."
+        )
+
+    return (f'<div class="notice notice-warn"><b>Check this profile</b>. {body}'
+            + (f"<ul>{items}</ul>" if items else "") + "</div>")
 
 # ============================================================================
 # METRIC CALCULATIONS
 # ============================================================================
 
+def domain_of(topic: dict | None) -> str | None:
+    """The top-level domain a topic sits in; there are four."""
+    return topic.get("domain") if isinstance(topic, dict) else None
+
+
+def field_of(topic: dict | None) -> str | None:
+    """The field label at the configured level of OpenAlex's topic hierarchy.
+
+    Returns None — never a placeholder — when a work carries no topic, so that
+    unclassified works can be counted rather than silently dropped.
+    """
+    if not isinstance(topic, dict):
+        return None
+    for level in Config.FIELD_LEVELS[Config.FIELD_LEVELS.index(Config.FIELD_LEVEL):]:
+        name = topic.get(level)
+        if name:
+            return name
+    return None
+
+
+# Disparity comes from OpenAlex's own hierarchy rather than from embedding the
+# field names. Embedding the labels was tried first and barely discriminated:
+# d(Medicine, Nursing) came out 0.30 against d(Medicine, Astronomy) 0.33, so the
+# term was close to a constant and Rao-Stirling collapsed onto its balance
+# component. The taxonomy separates them properly.
+DISPARITY_SAME_DOMAIN = 0.5      # e.g. Medicine and Nursing, both Health Sciences
+DISPARITY_CROSS_DOMAIN = 1.0     # e.g. Medicine and Physics and Astronomy
+DISPARITY_UNKNOWN = 0.5          # a field whose domain never appeared in the data
+
+
+def field_disparity(fields: list[str], domains: dict) -> np.ndarray:
+    """How far apart each pair of fields is, on OpenAlex's four-domain hierarchy.
+
+    Same field 0; different field inside one domain 0.5; different domain 1.
+    """
+    n = len(fields)
+    d = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            di, dj = domains.get(fields[i]), domains.get(fields[j])
+            if not di or not dj:
+                value = DISPARITY_UNKNOWN
+            elif di == dj:
+                value = DISPARITY_SAME_DOMAIN
+            else:
+                value = DISPARITY_CROSS_DOMAIN
+            d[i, j] = d[j, i] = value
+    return d
+
+
+def diversity_of(field_counts: dict, field_domains: dict | None = None) -> dict:
+    """Rao–Stirling diversity, plus the effective number of fields.
+
+    Rao–Stirling combines variety, balance, and disparity:
+        RS = sum over i != j of  d_ij * p_i * p_j
+    It sits well below 100 in practice, which is why the interface presents
+    these numbers as comparative rather than as a grade.
+    """
+    if not field_counts:
+        return {"field_counts": {}, "diversity_index": 0.0, "entropy": 0.0,
+                "effective_fields": 0.0, "unique_fields": 0, "total": 0}
+
+    fields = list(field_counts)
+    counts = np.array([field_counts[f] for f in fields], dtype=float)
+    p = counts / counts.sum()
+
+    shannon = float(entropy(p, base=np.e))
+    effective = float(np.exp(shannon))
+
+    if len(fields) == 1:
+        rs = 0.0
+    else:
+        d = field_disparity(fields, field_domains or {})
+        rs = float(p @ d @ p)
+
+    return {
+        "field_counts": dict(field_counts),
+        "diversity_index": min(100.0, rs * 100.0),
+        "entropy": shannon,
+        "effective_fields": effective,
+        "unique_fields": len(fields),
+        "total": int(counts.sum()),
+    }
+
+
 def calculate_embedding_dispersion(abstracts: list[str]) -> dict:
-    """
-    Calculate dispersion score based on pairwise cosine distances between paper embeddings.
-    Higher dispersion = more diverse topics = more interdisciplinary.
-    """
+    """Mean pairwise cosine distance between the author's own papers."""
     if len(abstracts) < 2:
         return {"dispersion_score": 0, "embeddings": None}
 
@@ -164,168 +520,104 @@ def calculate_embedding_dispersion(abstracts: list[str]) -> dict:
         embeddings = sentence_model.encode(abstracts, convert_to_tensor=True, device=Config.DEVICE)
         embeddings_np = embeddings.cpu().numpy()
 
-    # Calculate average pairwise cosine distance
-    # Distance of 0 = identical, distance of 1 = orthogonal, distance of 2 = opposite
-    pairwise_distances = pdist(embeddings_np, metric='cosine')
-    avg_distance = np.mean(pairwise_distances)
+    avg_distance = float(np.mean(pdist(embeddings_np, metric="cosine")))
+    return {"dispersion_score": min(100.0, avg_distance * 100),
+            "embeddings": embeddings_np}
 
-    # Convert to 0-100 scale (cosine distance naturally ranges 0-1 for similar domain texts)
-    dispersion_score = min(100, avg_distance * 100)
 
-    return {"dispersion_score": float(dispersion_score), "embeddings": embeddings_np}
+def calculate_reference_diversity(papers: list[dict], reference_topics: dict) -> dict:
+    """How widely the author's reference lists spread across fields.
 
-async def fetch_reference_fields_batched(paper_id: str, client: httpx.AsyncClient, limit: int = 50) -> list[str]:
-    """Fetch fields for referenced works using batched API calls (50 works per batch).
-
-    This reduces API calls from ~50 per paper to ~2 per paper (98% reduction).
+    Counts every reference occurrence, so a work cited by two of the author's
+    papers counts twice, while the field lookup itself was de-duplicated.
     """
-    # First, get the list of referenced work IDs
-    data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/works/{paper_id}", params={"select": "referenced_works"})
-    if not data or not data.get("referenced_works"):
-        return []
+    field_counts = defaultdict(int)
+    field_domains: dict[str, str] = {}
+    resolved = unresolved = 0
 
-    # Extract work IDs from URLs
-    work_ids = [url.split("/")[-1] for url in data["referenced_works"][:limit]]
-    if not work_ids:
-        return []
+    for paper in papers:
+        for ref_id in paper.get("referenced_works", []):
+            topic = reference_topics.get(ref_id)
+            field = field_of(topic)
+            if field:
+                field_counts[field] += 1
+                domain = domain_of(topic)
+                if domain:
+                    field_domains.setdefault(field, domain)
+                resolved += 1
+            else:
+                unresolved += 1
 
-    # Batch fetch in groups of 50 (OpenAlex limit for filter)
-    fields = []
-    BATCH_SIZE = 50
-    for i in range(0, len(work_ids), BATCH_SIZE):
-        batch = work_ids[i:i + BATCH_SIZE]
-        ids_filter = "|".join(batch)
+    result = diversity_of(dict(field_counts), field_domains)
+    result["field_domains"] = field_domains
+    result["classified"] = resolved
+    result["unclassified"] = unresolved
+    result["coverage"] = resolved / (resolved + unresolved) if (resolved + unresolved) else 0.0
+    return result
 
-        batch_data = await fetch_with_retry(
-            client,
-            f"{OPENALEX_BASE_URL}/works",
-            params={
-                "filter": f"openalex_id:{ids_filter}",
-                "select": "primary_topic,concepts",
-                "per_page": BATCH_SIZE
-            }
-        )
 
-        if batch_data and batch_data.get("results"):
-            for work in batch_data["results"]:
-                field = extract_field_from_paper(work)
-                if field != "Unknown":
-                    fields.append(field)
+def audience_field_counts(papers: list[dict]) -> tuple[dict, int, int]:
+    """Field distribution of the works citing this author, plus coverage."""
+    counts = defaultdict(int)
+    resolved = unresolved = 0
+    for paper in papers:
+        for citing in paper.get("citing", []):
+            field = field_of(citing.get("topic"))
+            if field:
+                counts[field] += 1
+                resolved += 1
+            else:
+                unresolved += 1
+    return dict(counts), resolved, unresolved
 
-    return fields
 
-def extract_field_from_paper(paper: dict) -> str:
-    if paper.get("primary_topic"):
-        topic = paper["primary_topic"]
-        if isinstance(topic, dict):
-            field = topic.get("field", {})
-            if isinstance(field, dict) and field.get("display_name"):
-                return field["display_name"]
-            domain = topic.get("domain", {})
-            if isinstance(domain, dict) and domain.get("display_name"):
-                return domain["display_name"]
-    if paper.get("concepts"):
-        for concept in paper["concepts"][:1]:
-            if concept.get("level", 0) <= 1 and concept.get("display_name"):
-                return concept["display_name"]
-    return "Unknown"
+def calculate_bridge_score(source_counts: dict, audience_counts: dict) -> dict:
+    """How much of the citing work exceeds what the author's own citing explains.
 
-async def calculate_reference_diversity(author_id: str, papers: list[dict], client: httpx.AsyncClient, progress_callback=None) -> dict:
-    all_field_counts = defaultdict(int)
+    For each field, the amount by which its share of the citing work exceeds its
+    share of the reference list; summed over fields where that is positive. This
+    is the total variation distance between the two distributions, taken in one
+    direction only, so it is bounded 0-1 and reads as "the share of citing work
+    that your own reading does not account for".
 
-    # Extract paper IDs
-    paper_ids = []
-    for paper in papers[:Config.TOP_N_PAPERS]:
-        paper_id = paper.get("id", "").split("/")[-1] if "/" in str(paper.get("id", "")) else paper.get("id", "")
-        if paper_id:
-            paper_ids.append(paper_id)
+    Weighted by volume, so one citing paper from an unrelated field moves it by a
+    fraction of a percent. And continuous, so a field you cite a little but that
+    cites you a lot still counts in proportion — no threshold to fall the wrong
+    side of.
+    """
+    if not source_counts or not audience_counts:
+        return {"source_fields": dict(source_counts), "audience_fields": dict(audience_counts),
+                "bridge_score": 0.0, "bridged_fields": [], "common_fields": []}
 
-    if not paper_ids:
-        return {"field_counts": {}, "entropy_score": 0, "diversity_index": 0, "unique_fields": 0}
+    src_total = sum(source_counts.values()) or 1
+    aud_total = sum(audience_counts.values()) or 1
+    src_share = {f: c / src_total for f, c in source_counts.items()}
+    aud_share = {f: c / aud_total for f, c in audience_counts.items()}
 
-    # Fetch all papers' references in parallel
-    if progress_callback:
-        progress_callback(f"Fetching references for {len(paper_ids)} papers...")
-    tasks = [fetch_reference_fields_batched(pid, client, Config.REFERENCES_PER_PAPER) for pid in paper_ids]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
+    imbalance = {f: share - src_share.get(f, 0.0) for f, share in aud_share.items()}
+    bridged_mass = sum(v for v in imbalance.values() if v > 0)
 
-    # Aggregate fields from all results
-    for i, fields in enumerate(results):
-        if isinstance(fields, Exception):
-            logger.warning(f"Error fetching references for paper {paper_ids[i]}: {fields}")
-            continue
-        for field in fields:
-            all_field_counts[field] += 1
+    bridged = sorted(
+        (f for f, v in imbalance.items() if v >= Config.BRIDGE_MIN_SHARE),
+        key=lambda f: imbalance[f], reverse=True,
+    )
+    common = sorted(
+        (f for f in aud_share if imbalance[f] < Config.BRIDGE_MIN_SHARE),
+        key=lambda f: aud_share[f], reverse=True,
+    )
 
-    if not all_field_counts:
-        return {"field_counts": {}, "entropy_score": 0, "diversity_index": 0, "unique_fields": 0}
+    return {
+        "source_fields": dict(source_counts),
+        "audience_fields": dict(audience_counts),
+        "bridge_score": min(100.0, bridged_mass * 100.0),
+        "bridged_fields": bridged,
+        "common_fields": common,
+        "imbalance": imbalance,
+    }
 
-    total = sum(all_field_counts.values())
-    probabilities = [count / total for count in all_field_counts.values()]
-    entropy_score = entropy(probabilities, base=2)
-    max_entropy = np.log2(len(all_field_counts)) if len(all_field_counts) > 1 else 1
-    diversity_index = (entropy_score / max_entropy) * 100 if max_entropy > 0 else 0
-
-    return {"field_counts": dict(all_field_counts), "entropy_score": float(entropy_score), "diversity_index": float(diversity_index), "unique_fields": len(all_field_counts)}
-
-async def fetch_citing_paper_fields(paper_id: str, client: httpx.AsyncClient, limit: int = 50) -> list[str]:
-    data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/works", params={"filter": f"cites:{paper_id}", "per_page": limit, "sort": "publication_date:desc", "select": "id,primary_topic,concepts"})
-    if not data or not data.get("results"):
-        return []
-    return [extract_field_from_paper(p) for p in data["results"] if extract_field_from_paper(p) != "Unknown"]
-
-async def calculate_bridge_score(author_id: str, papers: list[dict], client: httpx.AsyncClient, progress_callback=None, source_field_counts: dict | None = None) -> dict:
-    audience_field_counts = defaultdict(int)
-
-    # Extract paper IDs
-    paper_ids = []
-    for paper in papers[:Config.TOP_N_PAPERS]:
-        paper_id = paper.get("id", "").split("/")[-1] if "/" in str(paper.get("id", "")) else paper.get("id", "")
-        if paper_id:
-            paper_ids.append(paper_id)
-
-    if not paper_ids:
-        return {"source_fields": {}, "audience_fields": {}, "bridge_score": 0, "bridged_fields": [], "common_fields": []}
-
-    # Reuse source fields from reference diversity if provided, otherwise fetch
-    if source_field_counts is None:
-        if progress_callback:
-            progress_callback(f"Fetching reference fields for {len(paper_ids)} papers...")
-        ref_tasks = [fetch_reference_fields_batched(pid, client, Config.REFERENCES_PER_PAPER) for pid in paper_ids]
-        ref_results = await asyncio.gather(*ref_tasks, return_exceptions=True)
-        source_field_counts = defaultdict(int)
-        for i, fields in enumerate(ref_results):
-            if isinstance(fields, Exception):
-                logger.warning(f"Error fetching references for bridge score (paper {paper_ids[i]}): {fields}")
-                continue
-            for field in fields:
-                source_field_counts[field] += 1
-        source_field_counts = dict(source_field_counts)
-
-    # Fetch audience fields (citing papers)
-    if progress_callback:
-        progress_callback(f"Fetching citing fields for {len(paper_ids)} papers...")
-    cite_tasks = [fetch_citing_paper_fields(pid, client, Config.CITATIONS_PER_PAPER) for pid in paper_ids]
-    cite_results = await asyncio.gather(*cite_tasks, return_exceptions=True)
-
-    for i, fields in enumerate(cite_results):
-        if isinstance(fields, Exception):
-            logger.warning(f"Error fetching citing fields for bridge score (paper {paper_ids[i]}): {fields}")
-            continue
-        for field in fields:
-            audience_field_counts[field] += 1
-
-    if not source_field_counts or not audience_field_counts:
-        return {"source_fields": {}, "audience_fields": {}, "bridge_score": 0, "bridged_fields": [], "common_fields": []}
-
-    source_set, audience_set = set(source_field_counts.keys()), set(audience_field_counts.keys())
-    bridged_fields = audience_set - source_set
-    total_unique = len(source_set | audience_set)
-    bridge_score = (len(bridged_fields) / total_unique) * 100 if total_unique > 0 else 0
-
-    return {"source_fields": dict(source_field_counts), "audience_fields": dict(audience_field_counts), "bridge_score": float(bridge_score), "bridged_fields": list(bridged_fields), "common_fields": list(source_set & audience_set)}
 
 def calculate_similarity_and_index(original_abstract: str, citing_abstracts: list[str]) -> tuple:
+    """External diversity for one paper: 1 - mean similarity to its citing work."""
     with torch.no_grad():
         e_orig = sentence_model.encode(original_abstract, convert_to_tensor=True, device=Config.DEVICE)
         e_cite = sentence_model.encode(citing_abstracts, convert_to_tensor=True, device=Config.DEVICE)
@@ -334,49 +626,63 @@ def calculate_similarity_and_index(original_abstract: str, citing_abstracts: lis
         avg_sim = sum(sims) / len(sims)
         return avg_sim, 1.0 - avg_sim, len(sims), sims
 
-async def fetch_citing_abstracts_parallel(citing_ids: list[str], client: httpx.AsyncClient) -> list[str]:
-    if not citing_ids:
-        return []
-    tasks = [fetch_paper_by_id(cid, client) for cid in citing_ids]
-    papers = await asyncio.gather(*tasks, return_exceptions=True)
-    return [reconstruct_abstract(p.get("abstract_inverted_index")) for p in papers if isinstance(p, dict) and reconstruct_abstract(p.get("abstract_inverted_index"))]
-
 # ============================================================================
 # VISUALIZATION FUNCTIONS
 # ============================================================================
+# Palette: the interface is ink-on-paper; colour is spent only where it does
+# semantic work. Two hues total — a cool/warm diverging pair for "you cite" vs
+# "cites you", and a single-hue sequential ramp for the similarity matrix.
+# Both come from the validated categorical slots 1 and 2 (all-pairs safe).
 
-def get_chart_layout(title: str, height: int = 350, width: int = None) -> dict:
-    """Common chart layout with minimal styling"""
+INK, INK_2, INK_3 = "#14161A", "#4A5058", "#868D97"
+RULE, RULE_SOFT, SURFACE = "#E4E7EB", "#F1F3F5", "#FFFFFF"
+COOL, WARM = "#2A78D6", "#EB6834"
+SANS = "IBM Plex Sans, -apple-system, sans-serif"
+MONO = "IBM Plex Mono, ui-monospace, monospace"
+SEQ = [[0.0, "#F7F9FC"], [0.35, "#CBDFF6"], [0.7, "#7FB0E8"], [1.0, COOL]]
+# Categorical slots 1-3 of the validated palette: the only run that clears every
+# colour-vision gate with all pairs on screen at once.
+COMPARE_SERIES = (COOL, WARM, "#1BAF7A")
+MAX_COMPARE = 3
+
+
+def get_chart_layout(title: str, height: int = 340, width: int = None) -> dict:
+    """Shared chart chrome: left-aligned title, recessive axes, mono numerals."""
     layout = {
         "title": dict(
             text=title,
-            font=dict(size=13, color="#111827", family="Zen Kaku Gothic New, sans-serif"),
-            x=0.5,
-            xanchor="center",
-            y=0.98,
-            yanchor="top"
+            font=dict(size=13, color=INK, family=SANS),
+            x=0, xanchor="left", y=0.97, yanchor="top",
         ),
-        "paper_bgcolor": "#FFFFFF",
-        "plot_bgcolor": "#FAFAFA",
-        "font": dict(family="Zen Kaku Gothic New, sans-serif", color="#374151", size=11),
-        "margin": dict(t=45, b=50, l=60, r=80),
+        "paper_bgcolor": SURFACE,
+        "plot_bgcolor": SURFACE,
+        "font": dict(family=SANS, color=INK_2, size=12),
+        "margin": dict(t=46, b=42, l=60, r=26),
         "height": height,
         "autosize": True,
         "modebar": dict(orientation="v", bgcolor="rgba(0,0,0,0)"),
         "hoverlabel": dict(
-            bgcolor="white",
-            font_size=12,
-            font_family="Zen Kaku Gothic New, sans-serif",
-            font_color="#111827",
-            bordercolor="#E5E7EB"
-        )
+            bgcolor=SURFACE, bordercolor=RULE, font_size=12,
+            font_family=MONO, font_color=INK,
+        ),
     }
     if width:
         layout["width"] = width
     return layout
 
+
+def _mono_ticks(size: int = 11, color: str = None) -> dict:
+    return dict(family=MONO, size=size, color=color or INK_3)
+
+
+def _short(label: str, limit: int = 30) -> str:
+    """Field names like 'Biochemistry, Genetics and Molecular Biology' overflow
+    the axis gutter; the full name stays in the hover text."""
+    return label if len(label) <= limit else label[:limit - 1] + "\u2026"
+
+
 def create_dispersion_chart(dispersion_data: dict, paper_titles: list[str]) -> go.Figure:
-    """Create a heatmap showing pairwise cosine similarity between papers."""
+    """Pairwise cosine similarity between the analysed papers (sequential, one hue)."""
     embeddings = dispersion_data.get("embeddings")
     if embeddings is None or len(embeddings) < 2:
         return None
@@ -388,320 +694,444 @@ def create_dispersion_chart(dispersion_data: dict, paper_titles: list[str]) -> g
     for i in range(n_papers):
         row = []
         for j in range(n_papers):
-            title_i = paper_titles[i][:40] + "..." if len(paper_titles[i]) > 40 else paper_titles[i]
-            title_j = paper_titles[j][:40] + "..." if len(paper_titles[j]) > 40 else paper_titles[j]
-            sim = sim_matrix[i, j]
+            ti = paper_titles[i][:44] + "..." if len(paper_titles[i]) > 44 else paper_titles[i]
+            tj = paper_titles[j][:44] + "..." if len(paper_titles[j]) > 44 else paper_titles[j]
             if i == j:
-                row.append(f"<b>Paper {i+1}</b><br>{title_i}<br><br>Self-similarity: 1.00")
+                row.append(f"P{i+1}  {ti}")
             else:
-                row.append(f"<b>Paper {i+1} vs Paper {j+1}</b><br><br>{title_i}<br><b>vs</b><br>{title_j}<br><br>Cosine Similarity: <b>{sim:.3f}</b>")
+                row.append(f"P{i+1} vs P{j+1}<br>{ti}<br>{tj}<br>similarity {sim_matrix[i, j]:.2f}")
         hover_text.append(row)
 
-    upper_tri = sim_matrix[np.triu_indices(n_papers, k=1)]
-    avg_sim = np.mean(upper_tri)
-    dispersion_score = dispersion_data.get("dispersion_score", 0)
-
-    z_data = sim_matrix.tolist()
+    avg_sim = float(np.mean(sim_matrix[np.triu_indices(n_papers, k=1)]))
+    labels = [f"P{i+1}" for i in range(n_papers)]
+    # Square cells mean the plot is only as wide as it is tall, so the box has
+    # to grow with the paper count or 25 papers collapse into a corner.
+    side = int(min(760, max(380, 90 + 22 * n_papers)))
+    # And every label cannot fit once there are more than a dozen rows.
+    every = max(1, -(-n_papers // 12))
+    shown = [lbl if i % every == 0 else "" for i, lbl in enumerate(labels)]
 
     fig = go.Figure(data=go.Heatmap(
-        z=z_data,
-        x=[f"P{i+1}" for i in range(n_papers)],
-        y=[f"P{i+1}" for i in range(n_papers)],
-        hovertext=hover_text,
-        hovertemplate="%{hovertext}<extra></extra>",
-        colorscale=[
-            [0.0, '#F3F4F6'],
-            [0.5, '#93C5FD'],
-            [0.75, '#3B82F6'],
-            [1.0, '#1E3A8A'],
-        ],
-        zmin=0,
-        zmax=1,
+        z=sim_matrix.tolist(), x=labels, y=labels,
+        hovertext=hover_text, hovertemplate="%{hovertext}<extra></extra>",
+        colorscale=SEQ, zmin=0, zmax=1, xgap=2, ygap=2,
         colorbar=dict(
-            title=dict(text="Cosine<br>Similarity", font=dict(size=11, color="#374151")),
-            tickfont=dict(size=10, color="#374151"),
-            tickvals=[0, 0.25, 0.5, 0.75, 1.0],
-            ticktext=["0 (Different)", "0.25", "0.5", "0.75", "1 (Identical)"],
-            len=0.8,
-            thickness=15,
-            x=1.02
-        )
+            thickness=8, len=0.62, outlinewidth=0, x=1.02, xpad=0,
+            tickvals=[0, 0.5, 1], ticktext=["0", ".5", "1"],
+            tickfont=_mono_ticks(10),
+        ),
     ))
 
-    fig.update_layout(**get_chart_layout("Paper Similarity Matrix", 500))
+    fig.update_layout(**get_chart_layout("Paper similarity", side))
     fig.update_layout(
-        autosize=True,
-        xaxis=dict(title="", tickfont=dict(size=9, color="#374151"), tickangle=0, side="bottom", type="category", categoryorder="array", categoryarray=[f"P{i+1}" for i in range(n_papers)]),
-        yaxis=dict(title="", tickfont=dict(size=9, color="#374151"), autorange="reversed", type="category", categoryorder="array", categoryarray=[f"P{i+1}" for i in range(n_papers)]),
-        margin=dict(l=50, r=100, t=60, b=100),
-        annotations=[
-            dict(
-                x=0.5, y=-0.15, xref='paper', yref='paper',
-                text=f"Average pairwise similarity: <b>{avg_sim:.3f}</b> | Dispersion score: <b>{dispersion_score:.0f}%</b><br><i>Lower similarity = higher dispersion = more interdisciplinary</i>",
-                showarrow=False, font=dict(size=11, color='#374151'), xanchor='center', align='center'
-            )
-        ]
+        margin=dict(t=46, b=54, l=52, r=26),
+        xaxis=dict(type="category", categoryorder="array", categoryarray=labels,
+                   tickmode="array", tickvals=labels, ticktext=shown,
+                   tickfont=_mono_ticks(10), title=""),
+        yaxis=dict(type="category", categoryorder="array", categoryarray=labels,
+                   autorange="reversed", scaleanchor="x", constrain="domain",
+                   tickmode="array", tickvals=labels, ticktext=shown,
+                   tickfont=_mono_ticks(10), title=""),
+        annotations=[dict(
+            x=0, y=-0.14, xref="paper", yref="paper", xanchor="left",
+            text=f"Mean pairwise similarity {avg_sim:.2f} — lower means the papers sit further apart",
+            showarrow=False, font=dict(size=11.5, color=INK_3, family=SANS),
+        )],
     )
-
     return fig
 
+
 def create_reference_diversity_chart(ref_diversity: dict) -> go.Figure:
+    """Fields this author draws on. Cool — same entity as 'you cite' in the flow chart."""
     field_counts = ref_diversity.get("field_counts", {})
     if not field_counts:
         return None
 
-    sorted_fields = sorted(field_counts.items(), key=lambda x: x[1], reverse=True)[:10][::-1]
-    labels, values = [f[0] for f in sorted_fields], [f[1] for f in sorted_fields]
+    ordered = sorted(field_counts.items(), key=lambda x: x[1], reverse=True)[:10][::-1]
+    labels, values = [f[0] for f in ordered], [f[1] for f in ordered]
 
-    fig = go.Figure(go.Bar(y=labels, x=values, orientation='h',
-        marker=dict(color='#000000', line=dict(width=0)),
-        text=values, textposition='outside', textfont=dict(size=10, color='#000000')))
-
-    fig.update_layout(**get_chart_layout("Fields You Reference"))
-    fig.update_xaxes(title="Count", title_font=dict(color="#374151", size=11), showgrid=True, gridcolor='#E5E7EB')
-    fig.update_yaxes(tickfont=dict(size=10, color="#374151"))
-    fig.update_layout(margin=dict(l=200, r=80))
+    fig = go.Figure(go.Bar(
+        y=[_short(l) for l in labels], x=values, orientation="h",
+        marker=dict(color=COOL, line=dict(width=0)),
+        text=values, textposition="outside", cliponaxis=False,
+        textfont=dict(size=11, color=INK, family=MONO),
+        customdata=labels,
+        hovertemplate="%{customdata}<br>%{x} references<extra></extra>",
+    ))
+    fig.update_layout(**get_chart_layout("Fields you draw on"))
+    fig.update_layout(margin=dict(t=46, b=42, l=180, r=90), bargap=0.42)
+    fig.update_xaxes(title="", showgrid=True, gridcolor=RULE_SOFT, zeroline=False,
+                     tickfont=_mono_ticks())
+    fig.update_yaxes(tickfont=dict(size=12, color=INK_2, family=SANS), automargin=True)
     return fig
 
+
 def create_bridge_chart(bridge_data: dict) -> go.Figure:
-    source_fields, audience_fields = bridge_data.get("source_fields", {}), bridge_data.get("audience_fields", {})
+    """Diverging: fields you cite (cool, left) against fields citing you (warm, right)."""
+    source_fields = bridge_data.get("source_fields", {})
+    audience_fields = bridge_data.get("audience_fields", {})
     if not source_fields or not audience_fields:
         return None
 
-    sorted_sources = sorted(source_fields.items(), key=lambda x: x[1], reverse=True)[:6]
-    sorted_audience = sorted(audience_fields.items(), key=lambda x: x[1], reverse=True)[:6]
+    top = [f for f, _ in sorted(
+        {k: source_fields.get(k, 0) + audience_fields.get(k, 0)
+         for k in set(source_fields) | set(audience_fields)}.items(),
+        key=lambda x: x[1], reverse=True)[:8]][::-1]
+
+    cited = [source_fields.get(f, 0) for f in top]
+    citing = [audience_fields.get(f, 0) for f in top]
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(name='You cite', y=[f[0] for f in sorted_sources[::-1]], x=[-f[1] for f in sorted_sources[::-1]],
-        orientation='h', marker_color='#000000', text=[f[1] for f in sorted_sources[::-1]], textposition='inside', textfont=dict(color='white', size=9)))
-    fig.add_trace(go.Bar(name='Cite you', y=[f[0] for f in sorted_audience[::-1]], x=[f[1] for f in sorted_audience[::-1]],
-        orientation='h', marker_color='#9CA3AF', text=[f[1] for f in sorted_audience[::-1]], textposition='inside', textfont=dict(color='#000000', size=9)))
+    short = [_short(f) for f in top]
+    fig.add_trace(go.Bar(
+        name="You cite", y=short, x=[-v for v in cited], orientation="h",
+        marker_color=COOL, customdata=list(zip(top, cited)),
+        hovertemplate="%{customdata[0]}<br>you cite %{customdata[1]}<extra></extra>",
+    ))
+    fig.add_trace(go.Bar(
+        name="Cites you", y=short, x=citing, orientation="h",
+        marker_color=WARM, customdata=top,
+        hovertemplate="%{customdata}<br>cites you %{x}<extra></extra>",
+    ))
 
-    fig.update_layout(**get_chart_layout("Knowledge Flow"))
-    fig.update_layout(barmode='overlay', legend=dict(orientation='h', y=1.12, x=0.5, xanchor='center', font=dict(color="#374151", size=10)))
-    fig.update_xaxes(title="Count", title_font=dict(color="#374151", size=11), zeroline=True, zerolinecolor='#9CA3AF', zerolinewidth=2)
-    fig.update_yaxes(tickfont=dict(size=10, color="#374151"))
-    fig.update_layout(margin=dict(l=180, r=80))
+    span = max(max(cited or [0]), max(citing or [0])) or 1
+    step = max(1, int(round(span / 2)))
+
+    fig.update_layout(**get_chart_layout("Knowledge flow"))
+    fig.update_layout(
+        barmode="relative", bargap=0.42,
+        margin=dict(t=52, b=42, l=180, r=40),
+        legend=dict(orientation="h", y=1.16, x=1, xanchor="right",
+                    font=dict(size=11.5, color=INK_2, family=SANS)),
+    )
+    fig.update_xaxes(
+        title="", gridcolor=RULE_SOFT, zeroline=True, zerolinecolor=INK_3, zerolinewidth=1,
+        tickvals=[-2 * step, -step, 0, step, 2 * step],
+        ticktext=[str(2 * step), str(step), "0", str(step), str(2 * step)],
+        tickfont=_mono_ticks(),
+    )
+    fig.update_yaxes(tickfont=dict(size=12, color=INK_2, family=SANS), automargin=True)
     return fig
 
+
 def create_citation_fields_chart(audience_fields: dict) -> go.Figure:
+    """Fields citing this author. Warm — same entity as 'cites you' in the flow chart."""
     if not audience_fields:
         return None
 
-    sorted_fields = sorted(audience_fields.items(), key=lambda x: x[1], reverse=True)[:10][::-1]
-    labels, values = [f[0] for f in sorted_fields], [f[1] for f in sorted_fields]
-    total = sum(values)
+    ordered = sorted(audience_fields.items(), key=lambda x: x[1], reverse=True)[:10][::-1]
+    labels, values = [f[0] for f in ordered], [f[1] for f in ordered]
+    total = sum(values) or 1
 
-    fig = go.Figure(go.Bar(y=labels, x=values, orientation='h',
-        marker=dict(color='#6B7280', line=dict(width=0)),
-        text=[f"{v} ({v/total*100:.0f}%)" for v in values], textposition='outside', textfont=dict(size=9, color='#000000')))
-
-    fig.update_layout(**get_chart_layout("Who Cites Your Work"))
-    fig.update_xaxes(title="Citations", title_font=dict(color="#374151", size=11), showgrid=True, gridcolor='#E5E7EB')
-    fig.update_yaxes(tickfont=dict(size=10, color="#374151"))
-    fig.update_layout(margin=dict(l=200, r=100))
+    fig = go.Figure(go.Bar(
+        y=[_short(l) for l in labels], x=values, orientation="h",
+        marker=dict(color=WARM, line=dict(width=0)),
+        text=[f"{v}  {v/total*100:.0f}%" for v in values], textposition="outside", cliponaxis=False,
+        textfont=dict(size=11, color=INK, family=MONO),
+        customdata=labels,
+        hovertemplate="%{customdata}<br>%{x} citing works<extra></extra>",
+    ))
+    fig.update_layout(**get_chart_layout("Who cites your work"))
+    fig.update_layout(margin=dict(t=46, b=42, l=180, r=110), bargap=0.42)
+    fig.update_xaxes(title="", showgrid=True, gridcolor=RULE_SOFT, zeroline=False,
+                     tickfont=_mono_ticks())
+    fig.update_yaxes(tickfont=dict(size=12, color=INK_2, family=SANS), automargin=True)
     return fig
 
-def create_metrics_summary_chart(metrics: dict) -> go.Figure:
-    metric_config = [
-        {'name': 'External Diversity', 'key': 'citation_index', 'color': '#000000'},
-        {'name': 'Internal Diversity', 'key': 'dispersion_score', 'color': '#374151'},
-        {'name': 'Reference Diversity', 'key': 'reference_diversity', 'color': '#6B7280'},
-        {'name': 'Bridge Score', 'key': 'bridge_score', 'color': '#9CA3AF'},
-    ]
-
-    fig = go.Figure()
-
-    for i in range(4):
-        y = 3 - i
-        fig.add_shape(type="rect", x0=0, x1=20, y0=y-0.35, y1=y+0.35, fillcolor="rgba(156,163,175,0.1)", line_width=0, layer="below")
-        fig.add_shape(type="rect", x0=20, x1=50, y0=y-0.35, y1=y+0.35, fillcolor="rgba(156,163,175,0.2)", line_width=0, layer="below")
-        fig.add_shape(type="rect", x0=50, x1=80, y0=y-0.35, y1=y+0.35, fillcolor="rgba(156,163,175,0.3)", line_width=0, layer="below")
-        fig.add_shape(type="rect", x0=80, x1=100, y0=y-0.35, y1=y+0.35, fillcolor="rgba(156,163,175,0.4)", line_width=0, layer="below")
-
-    for i, cfg in enumerate(metric_config):
-        value = metrics.get(cfg['key'], 0)
-        y = 3 - i
-        fig.add_trace(go.Bar(x=[value], y=[y], orientation='h', marker_color=cfg['color'], width=0.5,
-            text=[f"{value:.0f}%"], textposition='outside', textfont=dict(size=12, color='#111827'),
-            hovertemplate=f"<b>{cfg['name']}</b>: {value:.1f}%<extra></extra>", showlegend=False))
-
-    fig.update_layout(**get_chart_layout("Metrics Overview", 280))
-    fig.update_xaxes(range=[0, 120], tickvals=[0, 20, 50, 80, 100], ticktext=['0', '20', '50', '80', '100'], tickfont=dict(color="#374151", size=10))
-    fig.update_yaxes(tickvals=[0,1,2,3], ticktext=[c['name'] for c in reversed(metric_config)], tickfont=dict(size=11, color="#374151"))
-    fig.update_layout(margin=dict(l=160, r=60))
-    return fig
 
 def create_scatter_chart(df: pd.DataFrame) -> go.Figure:
+    """External diversity of each paper against its publication year. Single series."""
     fig = go.Figure(go.Scatter(
-        x=df['year'].astype(int).tolist(),
-        y=df['paper_index'].tolist(),
-        mode='markers',
-        marker=dict(size=10, color='#000000', line=dict(width=1.5, color='white')),
-        text=df['title'].tolist(),
-        hovertemplate="<b>%{text}</b><br>Year: %{x}<br>Index: %{y:.1f}%<extra></extra>"
+        x=df["year"].astype(int).tolist(),
+        y=df["paper_index"].tolist(),
+        mode="markers",
+        marker=dict(size=9, color=INK, line=dict(width=1.5, color=SURFACE)),
+        text=df["title"].tolist(),
+        hovertemplate="%{text}<br>%{x} · external diversity %{y:.0f}<extra></extra>",
     ))
-
-    fig.update_layout(**get_chart_layout("External Diversity by Year"))
-    fig.update_xaxes(title="Year", title_font=dict(color="#374151", size=11), showgrid=True, gridcolor='#E5E7EB', dtick=1, tickfont=dict(size=10))
-    fig.update_yaxes(title="Index (%)", title_font=dict(color="#374151", size=11), showgrid=True, gridcolor='#E5E7EB', range=[0, 100], tickfont=dict(size=10))
+    fig.update_layout(**get_chart_layout("External diversity by year"))
+    # A long career spans ~30 years; forcing dtick=1 crams every label.
+    fig.update_xaxes(title="", showgrid=True, gridcolor=RULE_SOFT, zeroline=False,
+                     nticks=8, tickformat="d", tickfont=_mono_ticks())
+    fig.update_yaxes(title="", showgrid=True, gridcolor=RULE_SOFT, zeroline=False,
+                     range=[0, 100], tickfont=_mono_ticks())
     return fig
 
+
 def create_kde_chart(similarities: list) -> go.Figure:
+    """Distribution of paper-to-citer similarity across every citing work."""
     if not similarities or len(similarities) < 2:
         return None
-
     try:
         sims = [float(s) for s in similarities if s is not None]
         if len(sims) < 2:
             return None
-        kde = gaussian_kde(sims, bw_method=0.2)
+        kde = gaussian_kde(sims, bw_method=Config.KDE_BANDWIDTH)
         x_vals = np.linspace(min(sims), max(sims), 200)
-        y_vals = kde(x_vals)
 
         fig = go.Figure(go.Scatter(
-            x=x_vals.tolist(),
-            y=y_vals.tolist(),
-            fill='tozeroy',
-            mode='lines',
-            line=dict(color='#000000', width=2),
-            fillcolor='rgba(0, 0, 0, 0.1)',
-            hovertemplate="Similarity: %{x:.3f}<br>Density: %{y:.3f}<extra></extra>"
+            x=x_vals.tolist(), y=kde(x_vals).tolist(),
+            fill="tozeroy", mode="lines",
+            line=dict(color=INK, width=2), fillcolor="rgba(20,22,26,0.07)",
+            hovertemplate="similarity %{x:.2f}<extra></extra>",
         ))
-
-        fig.update_layout(**get_chart_layout("Similarity Distribution"))
-        fig.update_xaxes(title="Cosine Similarity", title_font=dict(color="#374151", size=11), showgrid=True, gridcolor='#E5E7EB', tickfont=dict(size=10))
-        fig.update_yaxes(title="Density", title_font=dict(color="#374151", size=11), showgrid=True, gridcolor='#E5E7EB', tickfont=dict(size=10))
+        fig.update_layout(**get_chart_layout("Similarity to citing work"))
+        fig.update_xaxes(title="", showgrid=True, gridcolor=RULE_SOFT, zeroline=False,
+                         tickfont=_mono_ticks())
+        fig.update_yaxes(title="", showgrid=False, zeroline=False, showticklabels=False)
         return fig
     except Exception as e:
         logger.warning(f"Could not create KDE chart: {e}")
         return None
 
+
 def create_keywords_chart(keyword_counts: list) -> go.Figure:
+    """Most frequent terms in the citing literature."""
     if not keyword_counts:
         return None
 
     top_keywords = keyword_counts[:10][::-1]
     labels, values = [kw[0] for kw in top_keywords], [kw[1] for kw in top_keywords]
 
-    fig = go.Figure(go.Bar(y=labels, x=values, orientation='h',
-        marker=dict(color='#374151', line=dict(width=0)),
-        text=values, textposition='outside', textfont=dict(size=10, color='#000000')))
-
-    fig.update_layout(**get_chart_layout("Top Keywords"))
-    fig.update_xaxes(title="Frequency", title_font=dict(color="#374151", size=11), showgrid=True, gridcolor='#E5E7EB', tickfont=dict(size=10))
-    fig.update_yaxes(tickfont=dict(size=10, color="#374151"))
-    fig.update_layout(margin=dict(l=160, r=80))
+    fig = go.Figure(go.Bar(
+        y=labels, x=values, orientation="h",
+        marker=dict(color=INK_2, line=dict(width=0)),
+        text=values, textposition="outside", cliponaxis=False,
+        textfont=dict(size=11, color=INK, family=MONO),
+        hovertemplate="%{y}<br>%{x} mentions<extra></extra>",
+    ))
+    fig.update_layout(**get_chart_layout("Terms in the citing literature"))
+    fig.update_layout(margin=dict(t=46, b=42, l=150, r=90), bargap=0.42)
+    fig.update_xaxes(title="", showgrid=True, gridcolor=RULE_SOFT, zeroline=False,
+                     tickfont=_mono_ticks())
+    fig.update_yaxes(tickfont=dict(size=12, color=INK_2, family=SANS), automargin=True)
     return fig
+def create_comparison_chart(entries: list[dict]) -> go.Figure:
+    """Four measures side by side for several researchers.
+
+    Capped at three series on purpose. The validated palette clears every
+    colour-vision gate for its first three slots when all pairs appear together,
+    as they do inside each metric group here; a fourth would put yellow beside
+    orange, which fails the normal-vision floor outright and cannot be rescued
+    by labelling.
+    """
+    if not entries:
+        return None
+
+    metrics = [("External diversity", "citation_index"),
+               ("Internal diversity", "dispersion_score"),
+               ("Reference diversity", "reference_diversity"),
+               ("Bridge", "bridge_score")]
+    labels = [m[0] for m in metrics][::-1]
+
+    fig = go.Figure()
+    for entry, colour in zip(entries, COMPARE_SERIES):
+        values = [entry["metrics"].get(key, 0) for _, key in metrics][::-1]
+        fig.add_trace(go.Bar(
+            name=entry["name"], y=labels, x=values, orientation="h",
+            marker_color=colour, cliponaxis=False,
+            text=[f"{v:.0f}" for v in values], textposition="outside",
+            textfont=dict(size=11, color=INK, family=MONO),
+            hovertemplate=f"<b>{entry['name']}</b><br>%{{y}} %{{x:.1f}}<extra></extra>",
+        ))
+
+    fig.update_layout(**get_chart_layout("Four measures compared", 420))
+    fig.update_layout(
+        barmode="group", bargap=0.34, bargroupgap=0.08,
+        margin=dict(t=58, b=44, l=176, r=64),
+        legend=dict(orientation="h", y=1.13, x=0, xanchor="left",
+                    font=dict(size=11.5, color=INK_2, family=SANS)),
+    )
+    fig.update_xaxes(title="", range=[0, 108], showgrid=True, gridcolor=RULE_SOFT,
+                     zeroline=False, tickvals=[0, 25, 50, 75, 100], tickfont=_mono_ticks())
+    fig.update_yaxes(tickfont=dict(size=12, color=INK_2, family=SANS), automargin=True)
+    return fig
+
 
 # ============================================================================
 # HTML EXPORT
 # ============================================================================
 
+def render_track(label: str, value: float) -> str:
+    """One row of the four-part profile: label, measured rail, value."""
+    v = max(0.0, min(100.0, float(value)))
+    ticks = "".join(f'<div class="track-tick" style="left:{t}%"></div>' for t in (0, 25, 50, 75, 100))
+    return (
+        '<div class="track">'
+        f'<div class="track-label">{label}</div>'
+        '<div class="track-rail">'
+        f'{ticks}'
+        f'<div class="track-fill" style="width:{v}%"></div>'
+        f'<div class="track-mark" style="left:{v}%"></div>'
+        '</div>'
+        f'<div class="track-val">{v:.0f}</div>'
+        '</div>'
+    )
+
+
+REPORT_CSS = """
+* { margin:0; padding:0; box-sizing:border-box; }
+:root {
+  --paper:#FAFAFB; --surface:#FFFFFF; --ink:#14161A; --ink-2:#4A5058; --ink-3:#868D97;
+  --rule:#E4E7EB; --rule-soft:#F1F3F5;
+  --sans:'IBM Plex Sans',-apple-system,BlinkMacSystemFont,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,monospace;
+}
+body { background:var(--paper); color:var(--ink); font-family:var(--sans);
+       font-size:15px; line-height:1.5; -webkit-font-smoothing:antialiased; }
+.container { max-width:1080px; margin:0 auto; padding:0 32px 96px; }
+.masthead { display:flex; align-items:center; gap:13px; padding:24px 0 16px;
+            border-bottom:1px solid var(--ink); margin-bottom:28px; }
+.masthead-logo { display:flex; flex:none; }
+.masthead-logo svg { height:30px; width:auto; display:block; }
+.masthead-mark { font-family:var(--mono); font-size:13px; font-weight:500;
+                 letter-spacing:.14em; text-transform:uppercase; }
+.masthead-note { margin-left:auto; font-family:var(--mono); font-size:12px; color:var(--ink-3); }
+.masthead-note a { color:var(--ink-2); text-decoration:underline;
+                   text-decoration-color:var(--rule); text-underline-offset:2px; }
+.card { background:var(--surface); border:1px solid var(--rule); border-radius:10px;
+        padding:26px 30px; margin-bottom:14px; }
+.profile-head { display:flex; align-items:baseline; justify-content:space-between; gap:16px;
+                padding-bottom:20px; border-bottom:1px solid var(--rule-soft); flex-wrap:wrap; }
+.profile-who { font-size:21px; font-weight:600; letter-spacing:-.01em; }
+.profile-id { font-family:var(--mono); font-size:12px; color:var(--ink-3); }
+.track { display:grid; grid-template-columns:186px 1fr 60px; align-items:center; gap:20px;
+         padding:14px 0; border-bottom:1px solid var(--rule-soft); }
+.track:last-of-type { border-bottom:none; }
+.track-label { font-size:12.5px; font-weight:500; letter-spacing:.07em;
+               text-transform:uppercase; color:var(--ink-2); }
+.track-rail { position:relative; height:22px; }
+.track-rail::before { content:""; position:absolute; left:0; right:0; top:10px; height:2px;
+                      background:var(--rule-soft); border-radius:1px; }
+.track-fill { position:absolute; left:0; top:10px; height:2px; background:var(--ink); border-radius:1px; }
+.track-mark { position:absolute; top:2px; width:2px; height:18px; background:var(--ink);
+              border-radius:1px; transform:translateX(-1px); }
+.track-tick { position:absolute; top:14px; width:1px; height:4px; background:var(--rule); }
+.track-val { font-family:var(--mono); font-size:22px; font-weight:500; text-align:right;
+             font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
+.profile-foot { display:flex; gap:24px; flex-wrap:wrap; padding-top:17px; margin-top:8px;
+                border-top:1px solid var(--rule-soft); font-size:12.5px; color:var(--ink-3); }
+.profile-foot b { font-family:var(--mono); font-weight:500; color:var(--ink-2); }
+.section-label { font-size:12px; font-weight:500; letter-spacing:.1em; text-transform:uppercase;
+                 color:var(--ink-3); margin:34px 0 10px; }
+.chart-container { background:var(--surface); border:1px solid var(--rule); border-radius:10px;
+                   padding:18px 20px; margin-bottom:14px; }
+.chart-container .plotly-graph-div { width:100% !important; }
+table { width:100%; border-collapse:collapse; font-size:14px; }
+th { text-align:left; font-size:11.5px; font-weight:500; letter-spacing:.09em; text-transform:uppercase;
+     color:var(--ink-3); padding:0 12px 10px; border-bottom:1px solid var(--rule); }
+td { padding:11px 12px; border-bottom:1px solid var(--rule-soft); color:var(--ink-2); }
+tr:last-child td { border-bottom:none; }
+td.n { font-family:var(--mono); font-variant-numeric:tabular-nums; text-align:right; color:var(--ink); }
+.rank { font-family:var(--mono); color:var(--ink-3); font-size:12px; }
+.note { font-size:13px; color:var(--ink-3); margin-top:10px; max-width:70ch; }
+.footer { color:var(--ink-3); font-size:12.5px; margin-top:40px; padding-top:20px;
+          border-top:1px solid var(--rule); font-family:var(--mono); }
+@media (max-width:860px) { .track { grid-template-columns:1fr 56px; gap:6px 14px; }
+                           .track-rail { grid-column:1/3; order:3; } }
+"""
+
+
 def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, composite_score: float,
                          scatter_fig, kde_fig, dispersion_fig, ref_div_fig, bridge_fig,
-                         field_breakdown_fig, bullet_fig, keyword_fig) -> str:
+                         field_breakdown_fig, keyword_fig) -> str:
     tempdir = tempfile.gettempdir()
-    html_path = os.path.join(tempdir, f"interdisciplinary_{author_name.replace(' ', '_')}.html")
+    safe_name = "".join(c if c.isalnum() or c in "-_" else "_" for c in author_name) or "report"
+    html_path = os.path.join(tempdir, f"interdisciplinary_{safe_name}.html")
 
     charts_html = []
     chart_configs = [
-        ("Metrics Overview", bullet_fig),
-        ("Paper Similarity Matrix", dispersion_fig),
-        ("External Diversity by Year", scatter_fig),
-        ("Similarity Distribution", kde_fig),
-        ("Fields Referenced", ref_div_fig),
-        ("Knowledge Flow", bridge_fig),
-        ("Citing Fields", field_breakdown_fig),
-        ("Top Keywords", keyword_fig),
+        ("Paper similarity", dispersion_fig),
+        ("Knowledge flow", bridge_fig),
+        ("Fields you draw on", ref_div_fig),
+        ("Who cites your work", field_breakdown_fig),
+        ("External diversity by year", scatter_fig),
+        ("Similarity to citing work", kde_fig),
+        ("Terms in the citing literature", keyword_fig),
     ]
 
     for title, fig in chart_configs:
         if fig is not None:
             try:
-                chart_html = fig.to_html(full_html=False, include_plotlyjs=False, config={'displayModeBar': True, 'responsive': True})
-                charts_html.append(f'<div class="chart-container"><h3>{title}</h3>{chart_html}</div>')
+                chart_html = fig.to_html(full_html=False, include_plotlyjs=False,
+                                         config={'displayModeBar': False, 'responsive': True})
+                charts_html.append(f'<div class="chart-container">{chart_html}</div>')
             except Exception as e:
                 logger.warning(f"Could not convert {title} chart: {e}")
 
     papers_table = ""
     if not df.empty:
-        papers_table = '''<table class="papers-table">
-            <thead><tr><th>#</th><th>Title</th><th>Year</th><th>External Diversity %</th><th>Citations</th></tr></thead>
-            <tbody>'''
+        rows = []
         for idx, row in df.iterrows():
-            title_text = row["Title"][:120] + "..." if len(str(row["Title"])) > 120 else row["Title"]
-            papers_table += f'<tr><td>{idx+1}</td><td>{title_text}</td><td>{row["Year"]}</td><td>{row["Index (%)"]:.1f}</td><td>{row.get("citation_count", "N/A")}</td></tr>'
-        papers_table += '</tbody></table>'
+            title_text = str(row["Title"])
+            if len(title_text) > 130:
+                title_text = title_text[:130] + "…"
+            rows.append(
+                f'<tr><td class="rank">{idx+1:02d}</td><td>{title_text}</td>'
+                f'<td class="n">{row["Year"]}</td>'
+                f'<td class="n">{row["Index (%)"]:.0f}</td>'
+                f'<td class="n">{row.get("citation_count", "—"):,}</td></tr>'
+            )
+        papers_table = (
+            '<table><thead><tr><th style="width:44px"></th><th>Paper</th>'
+            '<th style="width:70px">Year</th><th style="width:104px">External</th>'
+            '<th style="width:96px">Cited by</th></tr></thead><tbody>'
+            + "".join(rows) + '</tbody></table>'
+        )
+
+    tracks = (
+        render_track("External diversity", metrics.get('citation_index', 0))
+        + render_track("Internal diversity", metrics.get('dispersion_score', 0))
+        + render_track("Reference diversity", metrics.get('reference_diversity', 0))
+        + render_track("Bridge", metrics.get('bridge_score', 0))
+    )
 
     html_content = f'''<!DOCTYPE html>
 <html lang="en">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Interdisciplinary Index Report - {author_name}</title>
-    <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
-    <link href="https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700;900&display=swap" rel="stylesheet">
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; font-family: 'Zen Kaku Gothic New', sans-serif; }}
-        body {{ background: #FAFAFA; min-height: 100vh; padding: 48px 24px; }}
-        .container {{ max-width: 1400px; margin: 0 auto; }}
-        .header {{ background: #000; padding: 48px 40px; border-radius: 20px; text-align: center; color: white; margin-bottom: 32px; }}
-        .header h1 {{ font-size: 2.25rem; font-weight: 700; margin-bottom: 8px; }}
-        .header p {{ font-size: 1rem; color: rgba(255,255,255,0.8); }}
-        .card {{ background: white; border-radius: 16px; padding: 32px; margin-bottom: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #E5E7EB; }}
-        .card h2 {{ color: #111827; margin-bottom: 16px; font-size: 1.1rem; font-weight: 600; }}
-        .composite-score {{ font-size: 4rem; font-weight: 900; color: #111827; text-align: center; margin: 24px 0; }}
-        .metrics-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-top: 24px; }}
-        .metric-item {{ background: #FAFAFA; padding: 20px 16px; border-radius: 12px; text-align: center; border: 1px solid #E5E7EB; }}
-        .metric-item .label {{ font-size: 0.8rem; color: #374151; margin-bottom: 8px; text-transform: uppercase; font-weight: 600; }}
-        .metric-item .value {{ font-size: 1.75rem; font-weight: 700; color: #111827; }}
-        .charts-grid {{ display: flex; flex-direction: column; gap: 24px; margin-bottom: 24px; }}
-        .chart-container {{ background: white; border-radius: 16px; padding: 24px; box-shadow: 0 1px 3px rgba(0,0,0,0.08); border: 1px solid #E5E7EB; }}
-        .chart-container h3 {{ font-size: 1rem; font-weight: 600; color: #111827; margin-bottom: 16px; }}
-        .chart-container .plotly-graph-div {{ width: 100% !important; min-height: 400px; }}
-        .table-wrapper {{ max-height: 400px; overflow-y: auto; border: 1px solid #E5E7EB; border-radius: 12px; }}
-        .papers-table {{ width: 100%; border-collapse: collapse; font-size: 0.875rem; table-layout: fixed; }}
-        .papers-table th {{ background: #000; color: white; padding: 14px 16px; text-align: left; font-size: 0.75rem; font-weight: 500; position: sticky; top: 0; text-transform: uppercase; }}
-        .papers-table th:nth-child(1) {{ width: 50px; text-align: center; }}
-        .papers-table th:nth-child(2) {{ width: auto; }}
-        .papers-table th:nth-child(3) {{ width: 70px; text-align: center; }}
-        .papers-table th:nth-child(4) {{ width: 140px; text-align: center; }}
-        .papers-table th:nth-child(5) {{ width: 90px; text-align: center; }}
-        .papers-table td {{ padding: 14px 16px; border-bottom: 1px solid #F3F4F6; color: #374151; }}
-        .papers-table td:nth-child(1), .papers-table td:nth-child(3), .papers-table td:nth-child(4), .papers-table td:nth-child(5) {{ text-align: center; }}
-        .papers-table tr:hover td {{ background: #F9FAFB; }}
-        .footer {{ text-align: center; color: #6B7280; font-size: 0.85rem; margin-top: 48px; padding: 24px; border-top: 1px solid #E5E7EB; }}
-        @media (max-width: 900px) {{ .metrics-grid {{ grid-template-columns: repeat(2, 1fr); }} }}
-    </style>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Interdisciplinary Index — {author_name}</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.plot.ly/plotly-3.0.1.min.js" charset="utf-8"></script>
+<style>{REPORT_CSS}</style>
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>Interdisciplinary Index Report</h1>
-            <p>{author_name} &bull; Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}</p>
-        </div>
-        <div class="card">
-            <h2>Composite Interdisciplinary Score</h2>
-            <div class="composite-score">{composite_score:.1f}%</div>
-            <div class="metrics-grid">
-                <div class="metric-item"><div class="label">External Diversity</div><div class="value">{metrics.get('citation_index', 0):.1f}%</div></div>
-                <div class="metric-item"><div class="label">Internal Diversity</div><div class="value">{metrics.get('dispersion_score', 0):.1f}%</div></div>
-                <div class="metric-item"><div class="label">Reference Diversity</div><div class="value">{metrics.get('reference_diversity', 0):.1f}%</div></div>
-                <div class="metric-item"><div class="label">Bridge Score</div><div class="value">{metrics.get('bridge_score', 0):.1f}%</div></div>
-            </div>
-        </div>
-        <div class="card">
-            <h2>Top Papers Analyzed</h2>
-            <div class="table-wrapper">{papers_table}</div>
-        </div>
-        <div class="charts-grid">{''.join(charts_html)}</div>
-        <div class="footer"><p>Generated by Interdisciplinary Index Analyzer</p></div>
+<div class="container">
+  <div class="masthead">
+    <span class="masthead-logo">{MARK_SVG}</span>
+    <span class="masthead-mark">Interdisciplinary Index</span>
+    <span class="masthead-note">via <a href="https://openalex.org">openalex</a> &middot; {datetime.now().strftime('%Y-%m-%d %H:%M')}</span>
+  </div>
+
+  <div class="card">
+    <div class="profile-head">
+      <div class="profile-who">{author_name}</div>
+      <div class="profile-id">composite {composite_score:.0f}</div>
     </div>
-    <script>
-        window.addEventListener('resize', function() {{ document.querySelectorAll('.js-plotly-plot').forEach(p => Plotly.Plots.resize(p)); }});
-        window.addEventListener('load', function() {{ setTimeout(() => document.querySelectorAll('.js-plotly-plot').forEach(p => Plotly.Plots.resize(p)), 100); }});
-    </script>
+    {tracks}
+    <p class="note">Each measure runs 0&ndash;100 and the composite weights them equally.
+    These are relative measures: because scientific abstracts share a great deal of
+    language, the semantic scores rarely approach zero even for tightly focused work,
+    so they are most useful compared against another researcher or against the same
+    researcher over time.</p>
+  </div>
+
+  <div class="section-label">Papers analysed</div>
+  <div class="card">{papers_table}</div>
+
+  <div class="section-label">Charts</div>
+  {''.join(charts_html)}
+
+  <div class="footer">Generated by the Interdisciplinary Index</div>
+</div>
+<script>
+  window.addEventListener('resize', function () {{
+    document.querySelectorAll('.js-plotly-plot').forEach(function (p) {{ Plotly.Plots.resize(p); }});
+  }});
+</script>
 </body>
 </html>'''
 
@@ -714,67 +1144,147 @@ def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, comp
 # MAIN ANALYSIS
 # ============================================================================
 
-async def analyze_author(author_id: str, author_name: str, cache_dir: str = None):
+async def analyze_author(author_id: str, author_name: str, cache_dir: str = None,
+                         progress_cb=None, exclude_ids: set | None = None):
     logger.info(f"={'='*50}")
     logger.info(f"Starting analysis for: {author_name} ({author_id})")
     start_time = datetime.now()
 
-    # Step 1: Cache
-    if not is_cached(author_id, cache_dir):
-        logger.info("[1/5] Building cache (first time - fetching papers and citations)...")
-        await build_author_cache(author_id, top_n=Config.TOP_N_PAPERS, citations_per_paper=Config.CITATIONS_PER_PAPER, cache_dir=cache_dir)
+    def step(frac: float, message: str):
+        """Report a step to the console and, when the UI supplies one, to the progress bar."""
+        logger.info(f"      {message}")
+        if progress_cb is not None:
+            try:
+                progress_cb(frac, desc=message)
+            except Exception:
+                pass  # a progress sink must never break the analysis
+
+    requested = Config.TOP_N_PAPERS
+    fetch_params = dict(
+        top_n=requested,
+        citations_per_paper=Config.CITATIONS_PER_PAPER,
+        references_per_paper=Config.REFERENCES_PER_PAPER,
+        seed=Config.SEED,
+        exclude_self_citations=Config.EXCLUDE_SELF_CITATIONS,
+    )
+    cache_key = {"schema": CACHE_SCHEMA, **fetch_params}
+
+    # ---- Everything the analysis needs, in ~21 requests, fetched once ----
+    if is_cached(author_id, cache_dir, params=cache_key):
+        step(0.05, "Reading cached data")
     else:
-        logger.info("[1/5] Loading from cache...")
+        step(0.05, "Fetching papers, citations and references")
+        await build_author_cache(author_id, cache_dir=cache_dir, **fetch_params)
 
     data = load_author_cache(author_id, cache_dir)
     top_papers = data["top_papers"]
-    logger.info(f"      Found {len(top_papers)} papers to analyze")
+    reference_topics = data.get("reference_topics", {})
 
-    results, all_keywords, similarities_all, all_citing_texts = [], [], [], []
+    # Papers the user has marked as not theirs are removed before anything is
+    # measured: a misattributed paper contaminates all four measures at once,
+    # contributing its own text, its references and its audience.
+    def paper_option(p):
+        return (f"{p['title'][:110]}{'…' if len(p['title']) > 110 else ''}  ·  "
+                f"{p.get('year') or '—'}  ·  {p.get('citation_count', 0):,} cited", p["id"])
 
-    async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
-        # Step 2: External Diversity (per-paper citing abstracts)
-        total = len(top_papers)
-        logger.info(f"[2/5] Computing External Diversity ({total} papers)...")
-        for idx, paper in enumerate(top_papers):
-            logger.info(f"      Paper {idx+1}/{total}: {paper['title'][:50]}...")
-            abs_orig = reconstruct_abstract(paper.get("abstract_inverted_index"))
-            if not abs_orig:
-                continue
-            citing_texts = await fetch_citing_abstracts_parallel(paper.get("citing_ids", []), client)
-            if citing_texts:
-                avg_sim, idx_val, count, sims = calculate_similarity_and_index(abs_orig, citing_texts)
-                results.append({"title": paper["title"], "year": paper["year"], "paper_index": idx_val * 100, "citation_count": paper.get("citation_count", 0), "abstract": abs_orig})
-                similarities_all.extend(sims)
-                all_citing_texts.extend(citing_texts)
+    # Built before the filter runs: an excluded paper has to stay on the list,
+    # ticked, or there is no way to see what was removed or to put one back.
+    all_paper_choices = [paper_option(p) for p in top_papers]
 
-        # Step 3: Reference Diversity (parallel batched)
-        logger.info(f"[3/5] Computing Reference Diversity (parallel fetch for {total} papers)...")
-        ref_diversity = await calculate_reference_diversity(author_id, top_papers, client, progress_callback=logger.info)
+    excluded_count = 0
+    if exclude_ids:
+        kept = [p for p in top_papers if p["id"] not in exclude_ids]
+        excluded_count = len(top_papers) - len(kept)
+        top_papers = kept
+        logger.info(f"      excluding {excluded_count} paper(s) marked as not this author's")
 
-        # Step 4: Bridge Score (reuses reference fields from step 3)
-        logger.info(f"[4/5] Computing Bridge Score for {total} papers...")
-        bridge_data = await calculate_bridge_score(author_id, top_papers, client, progress_callback=logger.info, source_field_counts=ref_diversity["field_counts"])
+    logger.info(f"      {len(top_papers)} papers in cache")
 
-    # Step 5: Finalize (keywords, visualizations, report)
-    logger.info("[5/5] Finalizing analysis...")
-    logger.info("      Extracting keywords...")
-    for text in all_citing_texts[:50]:
-        try:
-            kws = kw_model.extract_keywords(text, top_n=3, stop_words='english')
-            all_keywords.extend([kw[0] for kw in kws])
-        except:
-            pass
+    if not top_papers:
+        raise NotEnoughData(
+            f"OpenAlex lists no works for {author_name} that carry both an abstract and a DOI, "
+            "so there is nothing to compare. This is common for very new profiles and for fields "
+            "where abstracts are not indexed."
+        )
 
-    logger.info("      Creating visualizations...")
+    # ---- External diversity, over the cached citing sample ----
+    results, uncited, all_keywords, similarities_all, all_citing_texts = [], [], [], [], []
+    total = len(top_papers)
+    for idx, paper in enumerate(top_papers):
+        step(0.15 + 0.45 * (idx / max(total, 1)),
+             f"Comparing citing work — paper {idx + 1} of {total}")
+        abs_orig = reconstruct_abstract(paper.get("abstract_inverted_index"))
+        if not abs_orig:
+            continue
+        citing_texts = [c["abstract"] for c in paper.get("citing", []) if c.get("abstract")]
+        if not citing_texts:
+            # Nothing usable cites it, so it has no external diversity — but
+            # its own text still says something about the spread of the work.
+            uncited.append({"title": paper["title"], "year": paper["year"],
+                            "citation_count": paper.get("citation_count", 0),
+                            "abstract": abs_orig})
+            continue
+        # Embedding is CPU-bound and was running straight on the event loop,
+        # which froze the whole server — and every progress update with it —
+        # for the length of the analysis. torch releases the GIL during compute,
+        # so a worker thread genuinely gives the loop back.
+        avg_sim, idx_val, count, sims = await asyncio.to_thread(
+            calculate_similarity_and_index, abs_orig, citing_texts)
+        results.append({
+            "title": paper["title"],
+            "doi": paper.get("doi"),
+            "year": paper["year"],
+            "paper_index": idx_val * 100,
+            "citation_count": paper.get("citation_count", 0),
+            "abstract": abs_orig,
+        })
+        similarities_all.extend(sims)
+        all_citing_texts.extend(citing_texts)
+
+    if not results:
+        raise NotEnoughData(
+            f"None of the {len(top_papers)} indexed papers for {author_name} has citing work with "
+            "an abstract, so external diversity cannot be computed. Well-cited work published some "
+            "years ago gives the most reliable reading."
+        )
+
+    # ---- Reference and bridge diversity, from the same cached records ----
+    step(0.62, "Measuring the spread of the reference lists")
+    ref_diversity = calculate_reference_diversity(top_papers, reference_topics)
+
+    step(0.70, "Working out which fields cite back")
+    audience_counts, aud_ok, aud_missing = audience_field_counts(top_papers)
+    bridge_data = calculate_bridge_score(ref_diversity["field_counts"], audience_counts)
+    audience_coverage = aud_ok / (aud_ok + aud_missing) if (aud_ok + aud_missing) else 0.0
+
+    step(0.80, "Pulling out common terms")
+
+    def extract_keywords(texts):
+        found = []
+        for text in texts:
+            try:
+                found.extend(kw[0] for kw in
+                             kw_model.extract_keywords(text, top_n=3, stop_words='english'))
+            except Exception:
+                pass
+        return found
+
+    all_keywords = await asyncio.to_thread(extract_keywords, all_citing_texts[:50])
+
+    step(0.90, "Drawing the charts")
     df = pd.DataFrame(results).dropna().sort_values(by="paper_index", ascending=False).reset_index(drop=True)
     citation_index = df['paper_index'].mean() if not df.empty else 0
 
-    sorted_abstracts = df['abstract'].tolist() if 'abstract' in df.columns else []
-    sorted_titles = df['title'].tolist() if 'title' in df.columns else []
+    # Internal diversity asks how far the author's own papers sit from each
+    # other, which needs no citing work, so papers whose citers carry no
+    # abstracts still belong here.
+    uncited_sorted = sorted(uncited, key=lambda p: p["citation_count"], reverse=True)
+    spread_abstracts = (df['abstract'].tolist() if 'abstract' in df.columns else []) \
+        + [p["abstract"] for p in uncited_sorted]
+    sorted_titles = (df['title'].tolist() if 'title' in df.columns else []) \
+        + [p["title"] for p in uncited_sorted]
 
-    logger.info("      Computing Internal Diversity (embedding dispersion)...")
-    dispersion_data = calculate_embedding_dispersion(sorted_abstracts)
+    dispersion_data = await asyncio.to_thread(calculate_embedding_dispersion, spread_abstracts)
 
     all_metrics = {
         'citation_index': citation_index,
@@ -782,12 +1292,7 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
         'reference_diversity': ref_diversity['diversity_index'],
         'bridge_score': bridge_data['bridge_score'],
     }
-    composite_score = (
-        citation_index * 0.25 +
-        dispersion_data['dispersion_score'] * 0.25 +
-        ref_diversity['diversity_index'] * 0.25 +
-        bridge_data['bridge_score'] * 0.25
-    )
+    composite_score = sum(all_metrics.values()) / len(all_metrics)
 
     scatter = create_scatter_chart(df) if not df.empty else None
     kde_fig = create_kde_chart(similarities_all)
@@ -795,601 +1300,1477 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
     ref_diversity_chart = create_reference_diversity_chart(ref_diversity)
     bridge_chart = create_bridge_chart(bridge_data)
     field_breakdown_chart = create_citation_fields_chart(bridge_data.get('audience_fields', {}))
-    bullet_chart = create_metrics_summary_chart(all_metrics)
     keyword_chart = create_keywords_chart(Counter(all_keywords).most_common(10))
 
-    logger.info("      Generating report...")
-    df_top_papers = df[["title", "year", "paper_index", "citation_count"]].copy()
-    df_top_papers.insert(0, "Rank", range(1, len(df_top_papers) + 1))
-    df_top_papers["paper_index"] = df_top_papers["paper_index"].round(1)
-    df_top_papers = df_top_papers.rename(columns={
-        "Rank": "#",
-        "title": "Paper Title",
-        "year": "Year",
-        "paper_index": "External Diversity %",
-        "citation_count": "Citations"
-    })
+    df_top_papers = papers_table_html(
+        df[["title", "doi", "year", "paper_index", "citation_count"]].to_dict("records"))
 
     df_report = df.rename(columns={"title": "Title", "year": "Year", "paper_index": "Index (%)"})
-    html_path = generate_html_report(author_name, df_report, all_metrics, composite_score, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, bullet_chart, keyword_chart)
+    html_path = generate_html_report(author_name, df_report, all_metrics, composite_score, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, keyword_chart)
 
-    category = categorize_index(composite_score)
+    # ---- provenance / coverage, shown under the profile ----
+    n_refs = ref_diversity["classified"] + ref_diversity["unclassified"]
+    n_citing = aud_ok + aud_missing
+    coverage = min(ref_diversity["coverage"], audience_coverage)
+    retrieved = get_cache_timestamp(author_id, cache_dir)
+    retrieved_str = retrieved.strftime("%Y-%m-%d %H:%M") if retrieved else "just now"
+
+    # The effective paper count varies by author — OpenAlex may hold fewer works
+    # with an abstract and a DOI than were asked for — and the bridge score
+    # depends on it, so the shortfall is stated rather than left to be inferred.
+    missing = requested - len(results)
+    shortfall = ""
+    if missing > 0:
+        reasons = []
+        if excluded_count:
+            reasons.append(f"{excluded_count} excluded by you")
+        if uncited:
+            reasons.append(f"{len(uncited)} not cited yet")
+        reason = ", ".join(reasons) or "OpenAlex holds no more with an abstract and a DOI"
+        shortfall = (f" <span class=\"foot-note\">of {requested}"
+                     f" &mdash; {reason}</span>")
 
     results_html = f"""
-    <div class="results-card">
-        <div class="score-display">
-            <div class="score-label">Composite Interdisciplinary Score</div>
-            <div class="score-value">{composite_score:.0f}%</div>
-            <div class="score-category">{category}</div>
-        </div>
-        <div class="metrics-grid">
-            <div class="metric-card">
-                <div class="metric-label">External Diversity</div>
-                <div class="metric-value">{citation_index:.0f}%</div>
-                <div class="metric-detail">{len(results)} papers analyzed</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Internal Diversity</div>
-                <div class="metric-value">{dispersion_data['dispersion_score']:.0f}%</div>
-                <div class="metric-detail">Topic spread</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Ref. Diversity</div>
-                <div class="metric-value">{ref_diversity['diversity_index']:.0f}%</div>
-                <div class="metric-detail">{ref_diversity['unique_fields']} fields</div>
-            </div>
-            <div class="metric-card">
-                <div class="metric-label">Bridge Score</div>
-                <div class="metric-value">{bridge_data['bridge_score']:.0f}%</div>
-                <div class="metric-detail">{len(bridge_data.get('bridged_fields', []))} bridged</div>
-            </div>
-        </div>
+    <div class="profile">
+      <div class="profile-head">
+        <div class="profile-who">{author_name}</div>
+        <div class="profile-id">{author_id} &middot; retrieved {retrieved_str}</div>
+      </div>
+      {render_track("External diversity", citation_index)}
+      {render_track("Internal diversity", dispersion_data['dispersion_score'])}
+      {render_track("Reference diversity", ref_diversity['diversity_index'])}
+      {render_track("Bridge", bridge_data['bridge_score'])}
+      <div class="profile-foot">
+        <span>Composite <b>{composite_score:.0f}</b></span>
+        <span>Papers analysed <b>{len(results)}</b>{shortfall}</span>
+        <span>Topic spread over <b>{len(spread_abstracts)}</b></span>
+        <span>Citing works <b>{n_citing}</b></span>
+        <span>References <b>{n_refs}</b></span>
+        <span>Effectively <b>{ref_diversity['effective_fields']:.1f}</b> fields</span>
+        <span>Bridged <b>{', '.join(bridge_data['bridged_fields'][:3]) or 'none'}</b></span>
+        <span>Classified <b>{coverage:.0%}</b></span>
+      </div>
     </div>
     """
 
-    explanation = """### How It Works
+    explanation = """### Reading these four numbers
 
-**Composite Score** is an equal-weighted average of four metrics:
+Each measures something different, on a 0&ndash;100 scale, and they are averaged
+into the composite with equal weight.
 
-<div style="display: flex; gap: 32px; flex-wrap: wrap; margin: 16px 0; align-items: flex-start;">
-<div style="flex: 1; min-width: 320px;">
-<table style="width: 100%; border-collapse: collapse;">
-<thead><tr style="background: #111827;"><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Metric</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Weight</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Description</th></tr></thead>
-<tbody>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">External Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">How different are papers that cite you from your own work</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Internal Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">How spread out your research topics are</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Reference Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Variety of fields you draw knowledge from</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Bridge Score</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Fields that cite you but you don't cite back</td></tr>
-</tbody></table>
-</div>
-<div style="flex: 0 0 auto; min-width: 200px; padding: 16px 20px; background: #F9FAFB; border-radius: 12px; border: 1px solid #E5E7EB;">
-<p style="font-weight: 700; margin-bottom: 10px; font-size: 0.85rem; text-transform: uppercase; color: #374151; letter-spacing: 0.3px;">Interpretation</p>
-<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">0-20%</span> &mdash; Low</p>
-<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">20-50%</span> &mdash; Moderate</p>
-<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">50-80%</span> &mdash; High</p>
-<p style="margin: 6px 0; color: #374151; font-size: 0.875rem;"><span style="font-weight: 600;">80-100%</span> &mdash; Very High</p>
-</div>
-</div>
+| | What it measures |
+|---|---|
+| **External diversity** | How far the work citing you sits from your own, semantically |
+| **Internal diversity** | How far your own papers sit from each other |
+| **Reference diversity** | How widely your references spread across fields, weighting how far apart those fields are |
+| **Bridge** | Share of the work citing you that your own reading does not account for |
+
+These are **relative** measures. Because any two scientific abstracts share a
+good deal of language, the semantic scores rarely fall near zero even for tightly
+focused work &mdash; so a number here is most useful compared against another
+researcher, or against the same researcher over time, rather than read as an
+absolute grade. The four are also not independent: external and internal
+diversity share an embedding space, and reference diversity and bridge share a
+field taxonomy, so the composite counts some of the same signal more than once.
+Prefer the four-part profile above to the single number.
 """
 
     elapsed = (datetime.now() - start_time).total_seconds()
     logger.info(f"={'='*50}")
     logger.info(f"Analysis completed for {author_name}")
-    logger.info(f"      Time: {elapsed:.1f}s | Composite Score: {composite_score:.1f}%")
-    logger.info(f"      Ext: {citation_index:.1f}% | Int: {dispersion_data['dispersion_score']:.1f}% | Ref: {ref_diversity['diversity_index']:.1f}% | Bridge: {bridge_data['bridge_score']:.1f}%")
+    logger.info(f"      Time: {elapsed:.1f}s | Composite: {composite_score:.1f}")
+    logger.info(f"      Ext: {citation_index:.1f} | Int: {dispersion_data['dispersion_score']:.1f} | Ref: {ref_diversity['diversity_index']:.1f} | Bridge: {bridge_data['bridge_score']:.1f}")
     logger.info(f"={'='*50}")
 
-    return (df_report, results_html, bullet_chart, df_top_papers, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, keyword_chart, explanation, html_path)
+    detail = {
+        "paper_choices": all_paper_choices,
+        "reference_fields": ref_diversity["field_counts"],
+        "field_domains": ref_diversity.get("field_domains", {}),
+        "audience_fields": bridge_data["audience_fields"],
+        "imbalance": bridge_data.get("imbalance", {}),
+        "bridged_fields": bridge_data.get("bridged_fields", []),
+        "effective_fields": ref_diversity["effective_fields"],
+        "papers_analysed": len(results),
+        "papers_excluded": excluded_count,
+        "coverage": min(ref_diversity["coverage"], audience_coverage),
+    }
+
+    return (df_report, results_html, df_top_papers, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, keyword_chart, explanation, html_path, all_metrics, detail)
+
+def candidate_choices(candidates: list[dict]) -> list[tuple[str, str]]:
+    """Radio options, one per candidate, as (label, author_id).
+
+    A table was tried first and truncated every column in a narrow pane, which
+    destroys the only information that tells two same-named researchers apart.
+    Two stacked lines survive any width.
+    """
+    options = []
+    for c in candidates:
+        # The name alone occupies the first line, which the card styling sets in
+        # bold; anything else there would be emphasised with it.
+        head = c["name"]
+        facts = [f for f in (c.get("institution"), c.get("span")) if f]
+        facts.append(f"{c['works_count']:,} works")
+        facts.append(f"{c['cited_by_count']:,} cited")
+        if c.get("orcid"):
+            facts.append(f"ORCID {c['orcid']}")
+        detail = " · ".join(facts)
+        if c.get("topics"):
+            detail += f"\n{c['topics']}"
+        options.append((f"{head}\n{detail}", c["id"]))
+    return options
+
+
+async def analyse_for_comparison(picked: list[dict], cache_dir: str = None,
+                                 on_step=None) -> tuple[list[dict], list[str]]:
+    """Analyse researchers the user has already chosen by profile.
+
+    Resolution happens in the picker, so this never guesses which "J. Smith" was
+    meant — the earlier version took the top search hit, which could silently
+    compare the wrong person, or a merged record.
+
+    Returns (entries, problems); one researcher failing does not sink the rest.
+    """
+    entries: list[dict] = []
+    problems: list[str] = []
+    total = len(picked) or 1
+
+    for i, who in enumerate(picked):
+        if any(e["id"] == who["id"] for e in entries):
+            continue
+
+        # Map each researcher's own 0-1 progress onto their slice of the bar,
+        # so the inner steps of a 15-second analysis are visible rather than
+        # the bar sitting still between researchers.
+        def slice_of(frac, desc, _i=i, _who=who):
+            if on_step:
+                on_step((_i + max(0.0, min(1.0, frac))) / total,
+                        f"{_who['name']} — {desc}")
+
+        if on_step:
+            on_step(i / total, f"Analysing {who['name']}")
+        try:
+            out = await analyze_author(who["id"], who["name"], cache_dir,
+                                       progress_cb=lambda f, desc="": slice_of(f, desc))
+        except (RateLimitExceeded, Throttled, InvalidAPIKey):
+            raise
+        except NotEnoughData as e:
+            problems.append(f"{who['name']}: {e}")
+            continue
+        except Exception as e:
+            logger.exception(f"Comparison failed for {who['id']}")
+            problems.append(f"{who['name']}: analysis failed ({type(e).__name__})")
+            continue
+        entries.append({"name": who["name"], "id": who["id"],
+                        "metrics": out[12], "detail": out[13]})
+
+    return entries, problems
+
+
+def papers_table_html(rows: list[dict]) -> str:
+    """The analysed papers as an HTML table.
+
+    Gradio's dataframe truncates its headers rather than wrapping them, which
+    turned "External diversity" into "E…" in a narrow pane. Rendering the table
+    directly keeps the headers legible and lets the titles be real links.
+    """
+    if not rows:
+        return ""
+    body = []
+    for i, r in enumerate(rows, 1):
+        title = r["title"]
+        cell = f'<a href="{r["doi"]}" target="_blank" rel="noopener">{title}</a>' if r.get("doi") else title
+        body.append(
+            f'<tr><td class="rank">{i:02d}</td><td class="title">{cell}</td>'
+            f'<td class="num" data-label="Year">{r["year"]}</td>'
+            f'<td class="num" data-label="External">{r["paper_index"]:.0f}</td>'
+            f'<td class="num" data-label="Cited by">{r["citation_count"]:,}</td></tr>'
+        )
+    return (
+        '<div class="section-label">Papers analysed, ranked by external diversity</div>'
+        '<div class="table-card"><table class="data-table"><thead><tr>'
+        '<th class="c-rank"></th><th>Paper</th>'
+        '<th class="c-num">Year</th><th class="c-num">External<br>diversity</th>'
+        '<th class="c-num">Cited by</th>'
+        '</tr></thead><tbody>' + "".join(body) + '</tbody></table></div>'
+    )
+
+
+MEASURE_LABELS = [
+    ("citation_index", "external diversity", "how far the work citing them sits from their own"),
+    ("dispersion_score", "internal diversity", "how far their own papers sit from each other"),
+    ("reference_diversity", "reference diversity", "how widely they read"),
+    ("bridge_score", "bridge", "how much of their audience their own reading does not explain"),
+]
+
+# Two 25-paper samples will differ by a few points for no reason at all. This is
+# a rule of thumb, not an interval — the app reports point estimates, so a gap
+# below it is simply not narrated rather than being called equal.
+MEANINGFUL_GAP = 8.0
+
+
+def _shares(counts: dict) -> dict:
+    total = sum(counts.values()) or 1
+    return {k: v / total for k, v in counts.items()}
+
+
+def _overlap(a: dict, b: dict) -> float:
+    """How much two field distributions coincide, 0 to 1.
+
+    The summed minimum of the two shares: 1 when identical, 0 when they have no
+    field in common. Easier to read than a cosine and it has a plain meaning —
+    the fraction of one distribution you could lay directly on top of the other.
+    """
+    if not a or not b:
+        return 0.0
+    sa, sb = _shares(a), _shares(b)
+    return sum(min(sa.get(f, 0.0), sb.get(f, 0.0)) for f in set(sa) | set(sb))
+
+
+def _distinctive(a: dict, b: dict, limit: int = 3) -> list[tuple[str, float, float]]:
+    """Fields where the first draws much more heavily than the second."""
+    sa, sb = _shares(a), _shares(b)
+    gaps = [(f, sa[f], sb.get(f, 0.0)) for f in sa]
+    gaps.sort(key=lambda x: x[1] - x[2], reverse=True)
+    return [g for g in gaps[:limit] if g[1] - g[2] > 0.05]
+
+
+def comparison_insights(entries: list[dict]) -> str:
+    """What the two profiles actually say about each other.
+
+    Deliberately descriptive. These measures describe citation patterns, not
+    quality, so nothing here ranks anyone or recommends anyone.
+    """
+    if len(entries) < 2:
+        return ""
+
+    pairs = [(entries[i], entries[j])
+             for i in range(len(entries)) for j in range(i + 1, len(entries))]
+    blocks = []
+
+    for a, b in pairs:
+        an, bn = a["name"], b["name"]
+        da, db = a.get("detail") or {}, b.get("detail") or {}
+        lines = []
+
+        # --- where they differ ---
+        gaps = []
+        for key, label, gloss in MEASURE_LABELS:
+            va, vb = a["metrics"].get(key, 0), b["metrics"].get(key, 0)
+            if abs(va - vb) >= MEANINGFUL_GAP:
+                higher, lower = (an, bn) if va > vb else (bn, an)
+                gaps.append(f"<li><b>{label.capitalize()}</b> — {higher} is "
+                            f"{abs(va - vb):.0f} points higher ({max(va, vb):.0f} against "
+                            f"{min(va, vb):.0f}): {gloss}.</li>")
+        if gaps:
+            lines.append("<p>Where they differ</p><ul>" + "".join(gaps) + "</ul>")
+        else:
+            lines.append("<p>No measure separates them by more than "
+                         f"{MEANINGFUL_GAP:.0f} points, which is inside what two "
+                         "25-paper samples can differ by for no reason.</p>")
+
+        # --- what they read, and who reads them ---
+        read = _overlap(da.get("reference_fields", {}), db.get("reference_fields", {}))
+        heard = _overlap(da.get("audience_fields", {}), db.get("audience_fields", {}))
+
+        def describe(x):
+            return ("almost entirely the same" if x > 0.75 else
+                    "largely the same" if x > 0.5 else
+                    "partly shared" if x > 0.25 else "barely overlapping")
+
+        lines.append(
+            f"<p>Overlap</p><ul>"
+            f"<li>What they <b>read</b> is {describe(read)} "
+            f"(<span class='ins-num'>{read:.0%}</span> of their reference fields coincide).</li>"
+            f"<li>Who <b>reads them</b> is {describe(heard)} "
+            f"(<span class='ins-num'>{heard:.0%}</span>).</li></ul>")
+
+        # --- what each brings that the other does not ---
+        only_a = _distinctive(da.get("reference_fields", {}), db.get("reference_fields", {}))
+        only_b = _distinctive(db.get("reference_fields", {}), da.get("reference_fields", {}))
+        if only_a or only_b:
+            def render(name, items):
+                if not items:
+                    return f"<li>{name} draws on nothing the other does not.</li>"
+                bits = ", ".join(f"{f} ({sa:.0%} against {sb:.0%})" for f, sa, sb in items)
+                return f"<li><b>{name}</b> draws on {bits}.</li>"
+            lines.append("<p>Literature each brings</p><ul>"
+                         + render(an, only_a) + render(bn, only_b) + "</ul>")
+
+        # --- complementarity: do they reach the same places? ---
+        ba, bb = set(da.get("bridged_fields", [])), set(db.get("bridged_fields", []))
+        shared, a_only, b_only = ba & bb, ba - bb, bb - ba
+        if ba or bb:
+            parts = []
+            if shared:
+                parts.append(f"both reach {', '.join(sorted(shared))}")
+            if a_only:
+                parts.append(f"only {an} reaches {', '.join(sorted(a_only))}")
+            if b_only:
+                parts.append(f"only {bn} reaches {', '.join(sorted(b_only))}")
+            verdict = ("They bridge into the same places, so on this evidence they "
+                       "extend into similar territory."
+                       if shared and not (a_only or b_only) else
+                       "They bridge into different places, so on this evidence they "
+                       "extend into different territory."
+                       if (a_only and b_only) and not shared else
+                       "Their bridging partly coincides.")
+            lines.append(f"<p>Where they reach beyond their own reading</p>"
+                         f"<ul><li>{'; '.join(parts)}.</li><li>{verdict}</li></ul>")
+
+        blocks.append(f'<div class="insight"><h4>{an} and {bn}</h4>{"".join(lines)}</div>')
+
+    caveat = ('<p class="ins-caveat">These describe citation patterns, not quality or '
+              'fit. Nothing here ranks anyone: a higher number means work travelling '
+              'further from its own field, which is not the same as work being better, '
+              'and the comparison is only valid because both were analysed the same way.</p>')
+    return f'<div class="insights"><div class="section-label">What the comparison shows</div>{"".join(blocks)}{caveat}</div>'
+
+
+def comparison_table_html(entries: list[dict]) -> str:
+    """Comparison figures as an HTML table, for the same reason."""
+    if not entries:
+        return ""
+    body = []
+    for e in entries:
+        m = e["metrics"]
+        body.append(
+            f'<tr><td class="title">{e["name"]}</td>'
+            f'<td class="num" data-label="External">{m["citation_index"]:.1f}</td>'
+            f'<td class="num" data-label="Internal">{m["dispersion_score"]:.1f}</td>'
+            f'<td class="num" data-label="Reference">{m["reference_diversity"]:.1f}</td>'
+            f'<td class="num" data-label="Bridge">{m["bridge_score"]:.1f}</td>'
+            f'<td class="num strong" data-label="Composite">{sum(m.values()) / 4:.1f}</td></tr>'
+        )
+    return (
+        '<div class="table-card"><table class="data-table"><thead><tr><th>Researcher</th>'
+        '<th class="c-num">External<br>diversity</th><th class="c-num">Internal<br>diversity</th>'
+        '<th class="c-num">Reference<br>diversity</th><th class="c-num">Bridge</th>'
+        '<th class="c-num">Composite</th></tr></thead><tbody>' + "".join(body) + '</tbody></table></div>'
+    )
+
 
 # ============================================================================
 # GRADIO UI
 # ============================================================================
 
-custom_css = """
-@import url('https://fonts.googleapis.com/css2?family=Zen+Kaku+Gothic+New:wght@400;500;700;900&display=swap');
+MARK_SVG = """
+<svg viewBox="0 0 173.2 200" role="img" aria-label="Interdisciplinary Index" focusable="false">
+  <defs><clipPath id="iiHexClip">
+    <path d="M86.6 3 L170.6 51.5 L170.6 148.5 L86.6 197 L2.6 148.5 L2.6 51.5 Z"/>
+  </clipPath></defs>
+  <g clip-path="url(#iiHexClip)">
+    <rect width="173.2" height="200" fill="#FAFAFB"/>
+    <rect x="24" y="54" width="62.6" height="15" fill="#2A78D6"/>
+    <rect x="86.6" y="54" width="62.6" height="15" fill="#EB6834"/>
+    <rect x="35" y="88" width="103.2" height="10" fill="#14161A"/>
+    <rect x="49" y="69" width="16" height="89" fill="#14161A"/>
+    <rect x="108.2" y="69" width="16" height="89" fill="#14161A"/>
+  </g>
+  <path d="M86.6 3 L170.6 51.5 L170.6 148.5 L86.6 197 L2.6 148.5 L2.6 51.5 Z"
+        fill="none" stroke="#14161A" stroke-width="6" stroke-linejoin="round"/>
+</svg>
+"""
+# Inlined rather than served: the whole mark is under 1KB, so it needs no static
+# route, no extra request, and it cannot 404. The clip id is namespaced because
+# the same markup is embedded twice on the exported report page.
+# Source of truth is brand/ii-hex.svg — keep the two in step.
 
-:root {
-    --primary: #000000;
-    --bg-light: #FAFAFA;
-    --text-dark: #000000;
-    --text-medium: #374151;
-    --text-light: #6B7280;
-    --border: #E5E7EB;
-    --border-light: #F3F4F6;
-}
+# Gradio 6's launch(favicon_path=...) emits no icon link at all, so the tab icon
+# is set here instead: the mark as a data URI, which needs no static route and
+# cannot 404.
+_FAVICON = "data:image/svg+xml," + urllib.parse.quote(MARK_SVG.strip())
 
-.gradio-container {
-    max-width: 100% !important;
-    font-family: 'Zen Kaku Gothic New', -apple-system, BlinkMacSystemFont, sans-serif !important;
-    -webkit-font-smoothing: antialiased;
-}
-
-.gradio-container label { font-weight: 600 !important; color: var(--text-dark) !important; font-size: 0.875rem !important; }
-
-.gradio-container input[type="text"], .gradio-container textarea {
-    border: 1.5px solid var(--border) !important;
-    border-radius: 8px !important;
-    font-size: 0.95rem !important;
-    padding: 10px 14px !important;
-}
-
-.gradio-container input[type="text"]:focus, .gradio-container textarea:focus {
-    border-color: #000 !important;
-    box-shadow: 0 0 0 3px rgba(0,0,0,0.08) !important;
-}
-
-/* Buttons */
-.gradio-container button {
-    font-weight: 500 !important;
-    border-radius: 8px !important;
-    font-size: 0.9rem !important;
-    border: none !important;
-    font-family: 'Zen Kaku Gothic New', sans-serif !important;
-}
-
-.primary-btn, .primary-btn *, button.lg, button.lg * {
-    background: #000 !important;
-    color: #FFF !important;
-    fill: #FFF !important;
-    padding: 10px 24px !important;
-}
-
-.primary-btn:hover, button.lg:hover { background: #1F1F1F !important; transform: translateY(-1px); box-shadow: 0 4px 12px rgba(0,0,0,0.2) !important; }
-
-/* Header */
-.header-section {
-    background: #000;
-    padding: 48px 40px;
-    border-radius: 16px;
-    margin-bottom: 32px;
-    text-align: center;
-    color: white;
-}
-
-.header-badge { display: inline-block; background: rgba(255,255,255,0.15); padding: 6px 16px; border-radius: 20px; font-size: 0.75rem; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 0.8px; font-weight: 500; color: #FFF; }
-.header-title { font-size: 2.5rem; font-weight: 700; margin-bottom: 12px; letter-spacing: -0.02em; color: #FFF; }
-.header-subtitle { font-size: 1.05rem; max-width: 800px; margin: 0 auto; color: rgba(255,255,255,0.8); }
-
-/* Results card */
-.results-card { background: white; padding: 32px; border-radius: 16px; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); margin-bottom: 24px; border: 1px solid var(--border); }
-.score-display { text-align: center; padding: 32px 24px; background: linear-gradient(135deg, #F9FAFB 0%, #FFF 100%); border-radius: 16px; margin-bottom: 24px; border: 1px solid var(--border); }
-.score-label { font-size: 0.875rem; color: var(--text-medium); text-transform: uppercase; margin-bottom: 12px; font-weight: 700; letter-spacing: 0.8px; }
-.score-value { font-size: 4rem; font-weight: 900; color: var(--text-dark); line-height: 1; letter-spacing: -0.03em; }
-.score-category { display: inline-block; margin-top: 16px; padding: 8px 20px; background: var(--border-light); color: var(--text-dark); border-radius: 24px; font-size: 0.85rem; font-weight: 700; text-transform: uppercase; }
-
-/* Metrics grid */
-.metrics-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; }
-.metric-card { background: #FFF; padding: 20px; border-radius: 12px; text-align: center; border: 1px solid var(--border); transition: all 0.2s; }
-.metric-card:hover { border-color: var(--text-light); transform: translateY(-2px); box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
-.metric-label { font-size: 0.8125rem; color: var(--text-medium); text-transform: uppercase; margin-bottom: 10px; font-weight: 700; letter-spacing: 0.5px; }
-.metric-value { font-size: 2rem; font-weight: 800; color: var(--text-dark); margin-bottom: 6px; }
-.metric-detail { font-size: 0.8125rem; color: var(--text-medium); margin-top: 6px; font-weight: 500; }
-
-/* Progress */
-.progress-container { display: flex; flex-direction: column; align-items: center; padding: 48px; background: white; border-radius: 16px; margin: 24px 0; border: 1px solid var(--border); }
-.progress-spinner { width: 48px; height: 48px; border: 4px solid var(--border-light); border-top-color: var(--primary); border-radius: 50%; animation: spin 0.7s linear infinite; margin-bottom: 20px; }
-@keyframes spin { to { transform: rotate(360deg); } }
-.progress-text { font-size: 1.1rem; font-weight: 700; color: var(--text-dark); }
-.progress-subtext { font-size: 0.9rem; color: var(--text-light); margin-top: 4px; }
-
-/* Dataframe/Table - font override only, let Gradio handle scrolling */
-.gradio-container .dataframe,
-.gradio-container .dataframe *,
-.gradio-container table,
-.gradio-container table *,
-.gradio-container [class*="table"],
-.gradio-container [class*="table"] *,
-.gradio-container .wrap,
-.gradio-container .wrap * {
-    font-family: 'Zen Kaku Gothic New', sans-serif !important;
-}
-
-/* Table container - visual styling only, NO overflow/max-height (Gradio handles this) */
-.gradio-container [data-testid="dataframe"] {
-    border: 1px solid var(--border) !important;
-    border-radius: 8px !important;
-}
-
-/* Table header - BLACK background with WHITE text */
-.gradio-container .dataframe thead,
-.gradio-container table thead,
-.gradio-container [data-testid="dataframe"] thead {
-    background: #000000 !important;
-    position: sticky !important;
-    top: 0 !important;
-    z-index: 10 !important;
-}
-
-.gradio-container .dataframe th,
-.gradio-container table th,
-.gradio-container thead th,
-.gradio-container [class*="header"] th,
-.gradio-container [data-testid="dataframe"] th,
-.gradio-container .table-wrap th {
-    color: #FFFFFF !important;
-    font-weight: 600 !important;
-    font-size: 0.7rem !important;
-    text-transform: uppercase !important;
-    letter-spacing: 0.3px !important;
-    padding: 12px 10px !important;
-    font-family: 'Zen Kaku Gothic New', sans-serif !important;
-    background: #000000 !important;
-    border-bottom: none !important;
-}
-
-/* Ensure header cell text is white */
-.gradio-container th *,
-.gradio-container thead *,
-.gradio-container [data-testid="dataframe"] th *,
-.gradio-container .table-wrap th * {
-    color: #FFFFFF !important;
-}
-
-.gradio-container .dataframe td,
-.gradio-container table td,
-.gradio-container tbody td,
-.gradio-container [data-testid="dataframe"] td {
-    padding: 12px 16px !important;
-    border-bottom: 1px solid var(--border-light) !important;
-    font-size: 0.875rem !important;
-    color: #374151 !important;
-    font-family: 'Zen Kaku Gothic New', sans-serif !important;
-    background: #FFFFFF !important;
-}
-
-/* Ensure ALL text inside table cells is visible */
-.gradio-container .dataframe td *,
-.gradio-container table td *,
-.gradio-container tbody td *,
-.gradio-container [data-testid="dataframe"] td *,
-.gradio-container [data-testid="dataframe"] td span,
-.gradio-container [data-testid="dataframe"] td div,
-.gradio-container [data-testid="dataframe"] td p,
-.gradio-container .table-wrap td *,
-.gradio-container .table-wrap td span,
-.gradio-container .table-wrap td div {
-    color: #374151 !important;
-    background: transparent !important;
-}
-
-.gradio-container .dataframe tr:hover td,
-.gradio-container table tr:hover td,
-.gradio-container [data-testid="dataframe"] tr:hover td {
-    background: #FAFAFA !important;
-}
-
-.gradio-container .dataframe tr:hover td *,
-.gradio-container [data-testid="dataframe"] tr:hover td * {
-    background: transparent !important;
-}
-
-/* Gradio DataFrame specific - target all internal elements */
-.gradio-container [data-testid="dataframe"] *,
-.gradio-container [data-testid="table"] *,
-.gradio-container .table-wrap *,
-.gradio-container .overflow-hidden * {
-    font-family: 'Zen Kaku Gothic New', sans-serif !important;
-}
-
-/* Force table body text color */
-.gradio-container tbody,
-.gradio-container tbody *,
-.gradio-container [data-testid="dataframe"] tbody,
-.gradio-container [data-testid="dataframe"] tbody * {
-    color: #374151 !important;
-}
-
-/* Tabs */
-.gradio-container .tabs { border-bottom: 2px solid var(--border) !important; margin-bottom: 24px !important; }
-.gradio-container .tabs button { font-weight: 600 !important; font-size: 0.95rem !important; color: var(--text-medium) !important; padding: 12px 20px !important; }
-.gradio-container .tabs button.selected { color: #000 !important; border-bottom: 3px solid #000 !important; }
-
-/* Accordion */
-.gradio-container .accordion { border: 1px solid var(--border) !important; border-radius: 12px !important; margin-top: 16px !important; }
-.gradio-container .accordion button { font-weight: 600 !important; font-size: 0.95rem !important; color: var(--text-dark) !important; }
-
-/* Markdown */
-.gradio-container .markdown-text { line-height: 1.7 !important; color: var(--text-medium) !important; }
-.gradio-container .markdown-text h2, .gradio-container .markdown-text h3 { color: var(--text-dark) !important; font-weight: 700 !important; margin-top: 24px !important; }
-.gradio-container .markdown-text table { border-collapse: collapse !important; width: 100% !important; margin: 16px 0 !important; }
-.gradio-container .markdown-text th { background: var(--bg-light) !important; padding: 10px 14px !important; font-weight: 600 !important; border: 1px solid var(--border) !important; }
-.gradio-container .markdown-text td { padding: 10px 14px !important; border: 1px solid var(--border) !important; }
-
-/* Responsive */
-@media (max-width: 1200px) { .metrics-grid { grid-template-columns: repeat(2, 1fr); } }
-@media (max-width: 768px) { .metrics-grid { grid-template-columns: 1fr; } .header-title { font-size: 1.875rem; } .score-value { font-size: 3rem; } }
-
-/* Footer */
-footer, footer * { color: #6B7280 !important; }
+PAGE_HEAD = f"""
+<link rel="icon" type="image/svg+xml" href="{_FAVICON}">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap" rel="stylesheet">
 """
 
-def create_interface():
-    theme = gr.themes.Soft(primary_hue=gr.themes.colors.gray, secondary_hue=gr.themes.colors.gray, neutral_hue=gr.themes.colors.gray)
+custom_css = """
+:root {
+    --paper: #FAFAFB;
+    --surface: #FFFFFF;
+    --ink: #14161A;
+    --ink-2: #4A5058;
+    --ink-3: #868D97;
+    --rule: #E4E7EB;
+    --rule-soft: #F1F3F5;
+    --cool: #2A78D6;
+    --warm: #EB6834;
+    --sans: 'IBM Plex Sans', -apple-system, BlinkMacSystemFont, sans-serif;
+    --mono: 'IBM Plex Mono', ui-monospace, SFMono-Regular, monospace;
+}
 
-    hide_theme_js = """
-    function() {
-        function hideTheme() {
-            document.querySelectorAll('h2, h3, h4, span, p').forEach(el => {
-                if (el.textContent?.trim() === 'Display Theme') {
-                    let section = el.parentElement;
-                    while (section && section.tagName !== 'BODY') {
-                        if (section.querySelector('button')) { section.style.display = 'none'; break; }
-                        section = section.parentElement;
-                    }
-                }
-            });
-        }
-        hideTheme();
-        new MutationObserver(hideTheme).observe(document.body, { childList: true, subtree: true });
+/* ---------- shell ---------- */
+/* Gradio 6 makes this a flex child, so it sizes to content unless told to
+   stretch; max-width alone leaves the page collapsed to about half width. */
+.gradio-container {
+    width: 100% !important;
+    max-width: 1120px !important;
+    margin: 0 auto !important;
+    background: var(--paper) !important;
+    font-family: var(--sans) !important;
+    color: var(--ink) !important;
+    -webkit-font-smoothing: antialiased;
+}
+.gradio-container > .main,
+.gradio-container .wrap > main.contain { width: 100% !important; }
+.gradio-container .prose, .gradio-container p, .gradio-container li { color: var(--ink-2); }
+.gradio-container h1, .gradio-container h2, .gradio-container h3 { color: var(--ink); font-weight: 600; letter-spacing: -0.01em; }
+
+/* ---------- masthead ---------- */
+.masthead {
+    display: flex; align-items: center; gap: 13px;
+    padding: 22px 2px 16px;
+    border-bottom: 1px solid var(--ink);
+    margin-bottom: 28px;
+}
+.masthead-logo { display: flex; flex: none; }
+.masthead-logo svg { height: 30px; width: auto; display: block; }
+.masthead-mark {
+    font-family: var(--mono); font-size: 13px; font-weight: 500;
+    letter-spacing: 0.14em; text-transform: uppercase; color: var(--ink);
+}
+.masthead-note {
+    margin-left: auto; font-family: var(--mono); font-size: 12px; color: var(--ink-3);
+}
+.masthead-note a {
+    color: var(--ink-2); text-decoration: underline;
+    text-decoration-color: var(--rule); text-underline-offset: 2px;
+}
+.masthead-note a:hover { color: var(--ink); text-decoration-color: var(--ink); }
+.masthead-lede {
+    font-size: 14.5px; color: var(--ink-2); margin: -14px 2px 26px; max-width: 62ch;
+}
+
+/* ---------- form controls ---------- */
+.gradio-container label, .gradio-container .label-wrap span {
+    font-family: var(--sans) !important; font-weight: 500 !important;
+    font-size: 13px !important; color: var(--ink-2) !important;
+}
+.gradio-container input[type="text"], .gradio-container textarea, .gradio-container select {
+    font-family: var(--sans) !important; font-size: 15px !important;
+    border: 1px solid var(--rule) !important; border-radius: 6px !important;
+    background: var(--surface) !important; color: var(--ink) !important;
+    padding: 10px 13px !important; box-shadow: none !important;
+}
+.gradio-container input[type="text"]:focus, .gradio-container textarea:focus {
+    border-color: var(--ink) !important;
+    box-shadow: 0 0 0 3px rgba(20,22,26,0.07) !important;
+    outline: none !important;
+}
+
+.gradio-container button {
+    font-family: var(--sans) !important; font-weight: 500 !important;
+    font-size: 14px !important; border-radius: 6px !important;
+}
+.primary-btn, .primary-btn * {
+    background: var(--ink) !important; color: #FFF !important; fill: #FFF !important;
+    border: 1px solid var(--ink) !important; padding: 10px 22px !important;
+}
+.primary-btn:hover { background: #000 !important; }
+.ghost-btn, .ghost-btn * {
+    background: transparent !important; color: var(--ink) !important;
+    border: 1px solid var(--rule) !important; padding: 10px 18px !important;
+}
+.ghost-btn:hover { background: var(--rule-soft) !important; border-color: var(--ink-3) !important; }
+.gradio-container button:focus-visible { outline: 2px solid var(--ink) !important; outline-offset: 2px !important; }
+
+/* ---------- the profile: hero ---------- */
+.profile {
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 28px 30px 22px; margin: 4px 0 6px;
+}
+.profile-head {
+    display: flex; align-items: baseline; justify-content: space-between; gap: 16px;
+    padding-bottom: 20px; border-bottom: 1px solid var(--rule-soft); flex-wrap: wrap;
+}
+.profile-who { font-size: 21px; font-weight: 600; letter-spacing: -0.01em; color: var(--ink); }
+.profile-id { font-family: var(--mono); font-size: 12px; color: var(--ink-3); }
+
+.track {
+    display: grid; grid-template-columns: 186px 1fr 60px; align-items: center;
+    gap: 20px; padding: 14px 0; border-bottom: 1px solid var(--rule-soft);
+}
+.track:last-of-type { border-bottom: none; }
+.track-label {
+    font-size: 12.5px; font-weight: 500; letter-spacing: 0.07em;
+    text-transform: uppercase; color: var(--ink-2);
+}
+.track-rail { position: relative; height: 22px; }
+.track-rail::before {
+    content: ""; position: absolute; left: 0; right: 0; top: 10px;
+    height: 2px; background: var(--rule-soft); border-radius: 1px;
+}
+.track-fill { position: absolute; left: 0; top: 10px; height: 2px; background: var(--ink); border-radius: 1px; }
+.track-mark { position: absolute; top: 2px; width: 2px; height: 18px; background: var(--ink); border-radius: 1px; transform: translateX(-1px); }
+.track-tick { position: absolute; top: 14px; width: 1px; height: 4px; background: var(--rule); }
+.track-val {
+    font-family: var(--mono); font-size: 22px; font-weight: 500; text-align: right;
+    font-variant-numeric: tabular-nums; letter-spacing: -0.02em; color: var(--ink);
+}
+.profile-foot {
+    display: flex; gap: 24px; flex-wrap: wrap; padding-top: 17px; margin-top: 8px;
+    border-top: 1px solid var(--rule-soft); font-size: 12.5px; color: var(--ink-3);
+}
+.profile-foot b { font-family: var(--mono); font-weight: 500; color: var(--ink-2); }
+.profile-foot .foot-note { color: var(--ink-3); }
+
+/* ---------- notices ---------- */
+.notice { border-radius: 0 6px 6px 0; padding: 13px 16px; font-size: 13.5px;
+    color: var(--ink-2); margin: 6px 0; }
+.notice b { color: var(--ink); font-weight: 600; }
+.notice-warn { border-left: 2px solid var(--warm); background: #FFF7F3; }
+.notice-info { border-left: 2px solid var(--cool); background: #F4F8FD; }
+.notice ul { margin: 8px 0 0 18px; }
+.notice li { margin: 3px 0; color: var(--ink-2); }
+
+/* ---------- progress ---------- */
+.progress-box {
+    display: flex; align-items: center; gap: 14px; padding: 20px 22px;
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px; margin: 6px 0;
+}
+.progress-spinner {
+    width: 18px; height: 18px; flex: none;
+    border: 2px solid var(--rule); border-top-color: var(--ink);
+    border-radius: 50%; animation: spin 0.8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .progress-spinner { animation-duration: 3s; } }
+.progress-body { flex: 1; min-width: 0; }
+.progress-text { font-size: 14px; font-weight: 500; color: var(--ink); }
+.progress-rail {
+    height: 3px; border-radius: 2px; background: var(--rule-soft); margin-top: 9px; overflow: hidden;
+}
+.progress-fill {
+    height: 100%; background: var(--ink); border-radius: 2px;
+    transition: width .25s ease;
+}
+.progress-sub { font-family: var(--mono); font-size: 12px; color: var(--ink-3); margin-top: 2px; }
+
+/* ---------- section labels ---------- */
+.section-label {
+    font-size: 12px; font-weight: 500; letter-spacing: 0.1em; text-transform: uppercase;
+    color: var(--ink-3); margin: 28px 0 2px;
+}
+
+/* ---------- tables ---------- */
+.gradio-container [data-testid="dataframe"] {
+    border: 1px solid var(--rule) !important; border-radius: 10px !important;
+    background: var(--surface) !important; overflow: hidden !important;
+}
+.gradio-container .dataframe, .gradio-container .dataframe *,
+.gradio-container table:not(.data-table), .gradio-container table:not(.data-table) * {
+    font-family: var(--sans) !important;
+}
+.gradio-container table:not(.data-table) thead th {
+    background: var(--surface) !important; color: var(--ink-3) !important;
+    font-size: 11.5px !important; font-weight: 500 !important;
+    letter-spacing: 0.09em !important; text-transform: uppercase !important;
+    border-bottom: 1px solid var(--rule) !important; padding: 12px 14px !important;
+    position: sticky !important; top: 0 !important; z-index: 5 !important;
+}
+.gradio-container table:not(.data-table) tbody td {
+    color: var(--ink-2) !important; font-size: 14px !important;
+    border-bottom: 1px solid var(--rule-soft) !important; padding: 11px 14px !important;
+}
+.gradio-container table:not(.data-table) tbody tr:hover td { background: var(--rule-soft) !important; }
+.gradio-container table:not(.data-table) tbody td:nth-child(1),
+.gradio-container table:not(.data-table) tbody td:nth-child(3),
+.gradio-container table:not(.data-table) tbody td:nth-child(4),
+.gradio-container table:not(.data-table) tbody td:nth-child(5) {
+    font-family: var(--mono) !important; font-variant-numeric: tabular-nums !important;
+    color: var(--ink) !important;
+}
+.gradio-container table:not(.data-table) tbody td a { color: var(--ink) !important; text-decoration: none !important;
+    border-bottom: 1px solid var(--rule) !important; }
+.gradio-container table:not(.data-table) tbody td a:hover { border-bottom-color: var(--ink) !important; }
+
+/* ---------- plots & panels ---------- */
+.gradio-container .block, .gradio-container .form {
+    background: transparent !important; border: none !important; box-shadow: none !important;
+}
+.gradio-container .block:has(.js-plotly-plot) > label.float { display: none !important; }
+.gradio-container .plot-container, .gradio-container [data-testid="plot"] {
+    background: var(--surface) !important; border: 1px solid var(--rule) !important;
+    border-radius: 10px !important; padding: 8px !important;
+}
+.gradio-container .tab-nav button {
+    color: var(--ink-3) !important; border: none !important; background: transparent !important;
+    font-size: 13.5px !important; padding: 10px 2px !important; margin-right: 22px !important;
+}
+.gradio-container .tab-nav button.selected {
+    color: var(--ink) !important; border-bottom: 2px solid var(--ink) !important;
+}
+.gradio-container .tab-nav { border-bottom: 1px solid var(--rule) !important; }
+
+/* ---------- markdown tables in About ---------- */
+.gradio-container .prose table:not(.data-table) { border-collapse: collapse; width: 100%; font-size: 14px; }
+.gradio-container .prose th:not(.c-num):not(.c-rank) {
+    background: var(--surface) !important; color: var(--ink-3) !important;
+    text-align: left; font-size: 11.5px; letter-spacing: 0.09em; text-transform: uppercase;
+    font-weight: 500; padding: 10px 14px; border-bottom: 1px solid var(--rule) !important;
+}
+.gradio-container .prose table:not(.data-table) td { padding: 10px 14px; border-bottom: 1px solid var(--rule-soft) !important; color: var(--ink-2); }
+
+/* The status slots stay mounted so the progress bar has an anchor; collapse
+   them to nothing while they hold no message. */
+.gradio-container .status-slot:not(:has(.notice)) { min-height: 0 !important; }
+.gradio-container .status-slot:not(:has(.notice)) .html-container { padding: 0 !important; }
+
+/* ---------- candidate picker ---------- */
+/* Each option is a two-line card: name and ORCID above, affiliation, dates and
+   counts below. Radio rather than a table so nothing truncates in a narrow pane. */
+.gradio-container .picker { border: none !important; background: transparent !important; }
+.gradio-container .picker > label,
+.gradio-container .picker .wrap { display: block !important; gap: 0 !important; }
+.gradio-container .picker fieldset,
+.gradio-container .picker .wrap {
+    display: flex !important; flex-direction: column !important; gap: 6px !important;
+}
+.gradio-container .picker label {
+    display: flex !important; align-items: flex-start !important; gap: 10px !important;
+    padding: 12px 14px !important; margin: 0 !important;
+    background: var(--surface) !important;
+    border: 1px solid var(--rule) !important; border-radius: 8px !important;
+    cursor: pointer; transition: border-color .12s ease, background .12s ease;
+    white-space: pre-line !important;
+    font-size: 13.5px !important; line-height: 1.45 !important;
+    color: var(--ink-2) !important; font-weight: 400 !important;
+}
+.gradio-container .picker label:hover { background: var(--rule-soft) !important; }
+.gradio-container .picker label:has(input:checked) {
+    border-color: var(--ink) !important; box-shadow: inset 0 0 0 1px var(--ink) !important;
+    background: var(--surface) !important;
+}
+.gradio-container .picker label input[type="radio"] { margin-top: 3px !important; accent-color: var(--ink); }
+.gradio-container .picker label span { white-space: pre-line !important; }
+/* first line of the label reads as the name */
+.gradio-container .picker label span::first-line {
+    font-weight: 600; color: var(--ink); font-size: 14.5px;
+}
+
+/* ---------- comparison list ---------- */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 12px 0 2px; }
+.chip {
+    display: inline-flex; align-items: baseline; gap: 8px;
+    padding: 7px 14px; border: 1px solid var(--ink); border-radius: 999px;
+    background: var(--surface); font-size: 13.5px;
+}
+.chip b { color: var(--ink); font-weight: 600; }
+.chip-meta { font-size: 12px; color: var(--ink-3); }
+.chip-note { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-left: 4px; }
+
+.setting-note { font-size: 12.5px; color: var(--ink-3); margin: 2px 2px 12px; max-width: 76ch; line-height: 1.5; }
+
+/* ---------- exclude-a-paper list ---------- */
+.gradio-container .exclude-list { border: none !important; background: transparent !important; }
+.gradio-container .exclude-list label {
+    display: flex !important; align-items: flex-start !important; gap: 10px !important;
+    padding: 9px 12px !important; margin: 0 0 4px !important;
+    background: var(--surface) !important;
+    border: 1px solid var(--rule) !important; border-radius: 6px !important;
+    font-size: 13px !important; line-height: 1.45 !important;
+    color: var(--ink-2) !important; font-weight: 400 !important; cursor: pointer;
+}
+.gradio-container .exclude-list label:hover { background: var(--rule-soft) !important; }
+.gradio-container .exclude-list label:has(input:checked) {
+    border-color: var(--warm) !important; background: #FFF7F3 !important;
+    text-decoration: line-through; color: var(--ink-3) !important;
+}
+.gradio-container .exclude-list input[type="checkbox"] { margin-top: 2px !important; accent-color: var(--warm); }
+
+/* ---------- comparison insights ---------- */
+.insights { margin-top: 20px; }
+.insight {
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 18px 22px; margin-bottom: 12px;
+}
+.insight h4 {
+    font-size: 14.5px; font-weight: 600; color: var(--ink); margin: 0 0 12px;
+}
+.insight > p {
+    font-size: 11px; font-weight: 500; letter-spacing: 0.08em; text-transform: uppercase;
+    color: var(--ink-3); margin: 14px 0 4px;
+}
+.insight > p:first-of-type { margin-top: 0; }
+.insight ul { margin: 0; padding-left: 18px; }
+.insight li { font-size: 13.5px; color: var(--ink-2); margin: 4px 0; line-height: 1.5; }
+.insight li b { color: var(--ink); font-weight: 600; }
+.ins-num { font-family: var(--mono); color: var(--ink); }
+.ins-caveat {
+    font-size: 12.5px; color: var(--ink-3); margin: 4px 2px 0; max-width: 78ch; line-height: 1.5;
+}
+
+/* ---------- data tables ---------- */
+.table-card {
+    background: var(--surface); border: 1px solid var(--rule); border-radius: 10px;
+    padding: 4px 6px 2px; overflow-x: auto; margin-bottom: 6px;
+}
+table.data-table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+table.data-table th {
+    text-align: left; vertical-align: bottom;
+    font-size: 11px; font-weight: 500; letter-spacing: 0.07em; text-transform: uppercase;
+    color: var(--ink-3); padding: 12px 12px 9px; border-bottom: 1px solid var(--rule);
+    white-space: normal; line-height: 1.3;
+}
+table.data-table th.c-num { text-align: right; }
+table.data-table th.c-rank { width: 38px; }
+table.data-table td {
+    padding: 10px 12px; border-bottom: 1px solid var(--rule-soft);
+    color: var(--ink-2); vertical-align: top;
+}
+table.data-table tr:last-child td { border-bottom: none; }
+table.data-table tr:hover td { background: var(--rule-soft); }
+table.data-table td.num {
+    font-family: var(--mono); font-variant-numeric: tabular-nums;
+    text-align: right; color: var(--ink); white-space: nowrap;
+}
+table.data-table td.num.strong { font-weight: 500; }
+table.data-table td.rank { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); }
+table.data-table td.title { color: var(--ink); }
+table.data-table td.title a {
+    color: var(--ink); text-decoration: underline;
+    text-decoration-color: var(--rule); text-underline-offset: 2px;
+}
+table.data-table td.title a:hover { text-decoration-color: var(--ink); }
+
+/* Below this width five columns cannot coexist: the title wraps to seven lines
+   and the last column falls off the edge. Stack each row instead, with every
+   figure announcing which measure it is. */
+@media (max-width: 720px) {
+    table.data-table thead { display: none; }
+    table.data-table, table.data-table tbody, table.data-table tr { display: block; width: 100%; }
+    table.data-table td { display: inline-block; border: none; padding: 2px 0; }
+    table.data-table tr {
+        padding: 12px 10px; border-bottom: 1px solid var(--rule-soft);
     }
-    """
+    table.data-table tr:hover td { background: transparent; }
+    table.data-table td.rank { display: inline-block; margin-right: 8px; }
+    table.data-table td.title { display: inline; font-size: 14px; }
+    table.data-table td.num {
+        text-align: left; margin: 6px 18px 0 0; white-space: nowrap;
+    }
+    table.data-table td.num::before {
+        content: attr(data-label);
+        font-family: var(--sans); font-size: 10.5px; letter-spacing: 0.07em;
+        text-transform: uppercase; color: var(--ink-3); margin-right: 6px;
+    }
+}
 
-    with gr.Blocks(css=custom_css, title="Interdisciplinary Index Analyzer", theme=theme, js=hide_theme_js) as demo:
+/* ---------- responsive ---------- */
+@media (max-width: 860px) {
+    .track { grid-template-columns: 1fr 56px; gap: 6px 14px; }
+    .track-rail { grid-column: 1 / 3; order: 3; }
+    .profile { padding: 22px 18px 18px; }
+}
+
+footer, footer * { color: var(--ink-3) !important; font-family: var(--sans) !important; }
+"""
+
+THEME = gr.themes.Soft(
+    primary_hue=gr.themes.colors.gray,
+    secondary_hue=gr.themes.colors.gray,
+    neutral_hue=gr.themes.colors.gray,
+)
+
+def create_interface():
+    with gr.Blocks(title="Interdisciplinary Index") as demo:
         cache_dir = gr.State(value=create_session_cache_dir)
         selected_author_id = gr.State(value="")
 
-        gr.HTML("""
-        <div class="header-section">
-            <div class="header-badge">Research Analytics Platform</div>
-            <h1 class="header-title">Interdisciplinary Index Analyzer</h1>
-            <p class="header-subtitle">Measure the cross-domain impact of academic research through advanced citation analysis and semantic modeling</p>
+        gr.HTML(f"""
+        <div class="masthead">
+            <span class="masthead-logo">{MARK_SVG}</span>
+            <span class="masthead-mark">Interdisciplinary Index</span>
+            <span class="masthead-note">via <a href="https://openalex.org" target="_blank" rel="noopener">openalex</a></span>
         </div>
+        <p class="masthead-lede">Measures how far a researcher's work travels across
+        disciplinary boundaries &mdash; who cites it, what it draws on, and which fields
+        it reaches that it never cites back.</p>
         """)
 
         with gr.Tabs():
-            with gr.Tab("Analyze"):
+            with gr.Tab("Analyse"):
                 with gr.Row():
-                    with gr.Column(scale=4):
-                        author_input = gr.Textbox(label="Search for a researcher", placeholder="Enter name (e.g., 'Yoshua Bengio')")
-                    with gr.Column(scale=1, min_width=140):
+                    with gr.Column(scale=5):
+                        author_input = gr.Textbox(
+                            label="Researcher",
+                            placeholder="Name, ORCID, or OpenAlex ID — e.g. Yoshua Bengio",
+                        )
+                    with gr.Column(scale=1, min_width=130):
                         search_btn = gr.Button("Search", elem_classes=["primary-btn"])
 
-                author_dropdown = gr.Dropdown(label="Select author", choices=[], interactive=True, visible=False)
-                analyze_btn = gr.Button("Run Analysis", elem_classes=["primary-btn"], visible=False, size="lg")
-                progress_html = gr.HTML(visible=False)
+                author_radio = gr.Radio(
+                    choices=[], label="Which profile?", visible=False,
+                    elem_classes=["picker"], container=False,
+                )
+                with gr.Row():
+                    analyze_btn = gr.Button("Run analysis", elem_classes=["primary-btn"], visible=False)
+                    refresh_btn = gr.Button("Refetch data", elem_classes=["ghost-btn"], visible=False)
+
+                # Always mounted, empty when idle: Gradio needs a visible output
+                # component to draw the progress bar on, and on a first run every
+                # other result slot is still hidden.
+                progress_html = gr.HTML(visible=True, elem_classes=["status-slot"])
                 results_html = gr.HTML(visible=False)
 
-                with gr.Row():
-                    bullet_chart = gr.Plot(label=None, visible=False)
+                with gr.Column(visible=False) as charts_group:
+                    gr.HTML('<div class="section-label">Where the work travels</div>')
+                    with gr.Row():
+                        ref_diversity_plot = gr.Plot(label=None)
+                        field_breakdown_plot = gr.Plot(label=None)
+                    # Both of these need the full width: the flow chart carries
+                    # long field names, and the matrix grows with paper count.
+                    with gr.Row():
+                        bridge_plot = gr.Plot(label=None)
+                    with gr.Row():
+                        dispersion_plot = gr.Plot(label=None)
+                    gr.HTML('<div class="section-label">Distribution and drift</div>')
+                    with gr.Row():
+                        scatter_plot = gr.Plot(label=None)
+                        kde_plot = gr.Plot(label=None)
+                    with gr.Row():
+                        keywords_plot = gr.Plot(label=None)
 
-                top_papers_table = gr.Dataframe(label="Top 10 Papers by External Diversity Score", visible=False, wrap=True, max_height=400)
-                dispersion_plot = gr.Plot(label=None, visible=False)
+                top_papers_table = gr.HTML(visible=False)
 
-                with gr.Accordion("Detailed Charts", open=True, visible=False) as charts_accordion:
-                    scatter_plot = gr.Plot(label=None)
-                    kde_plot = gr.Plot(label=None)
-                    ref_diversity_plot = gr.Plot(label=None)
-                    bridge_plot = gr.Plot(label=None)
-                    field_breakdown_plot = gr.Plot(label=None)
-                    keywords_plot = gr.Plot(label=None)
+                with gr.Accordion("Not their paper? Exclude it",
+                                  open=False, visible=False) as exclude_accordion:
+                    gr.HTML(
+                        '<p class="setting-note">OpenAlex sometimes files another '
+                        'person\'s work under this record. A misattributed paper affects '
+                        'every measure at once — its text, its references and its '
+                        'audience all count. Tick anything that is not theirs and '
+                        'recalculate; this reuses the data already fetched, so it is '
+                        'immediate.</p>'
+                    )
+                    exclude_group = gr.CheckboxGroup(
+                        choices=[], value=[], label=None, show_label=False,
+                        elem_classes=["exclude-list"], container=False,
+                    )
+                    with gr.Row():
+                        recalc_btn = gr.Button("Recalculate without these",
+                                               elem_classes=["primary-btn"])
+                        restore_btn = gr.Button("Put them all back",
+                                                elem_classes=["ghost-btn"])
+                    # Mirrors the main status slot. Recalculating is triggered from
+                    # the bottom of a very long page, and the other slot is far out
+                    # of view up there.
+                    exclude_status = gr.HTML(visible=True, elem_classes=["status-slot"])
 
-                with gr.Accordion("Papers Analyzed", open=False, visible=False) as papers_accordion:
-                    papers_table = gr.Dataframe(max_height=400)
+                with gr.Accordion("Full paper detail", open=False, visible=False) as papers_accordion:
+                    papers_table = gr.Dataframe(max_height=420)
 
-                html_download = gr.File(label="Download Interactive Report (HTML)", visible=False)
+                html_download = gr.File(label="Download report (HTML)", visible=False)
                 methodology_md = gr.Markdown(visible=False)
 
+            with gr.Tab("Compare"):
+                gr.HTML(
+                    '<p class="masthead-lede">These measures carry no absolute scale, so they '
+                    'mean most set against each other. Search for each researcher, pick the '
+                    'right profile, and add up to three.</p>'
+                )
+                with gr.Row():
+                    with gr.Column(scale=5):
+                        compare_search_box = gr.Textbox(
+                            label="Add a researcher",
+                            placeholder="Name, ORCID, or OpenAlex ID",
+                        )
+                    with gr.Column(scale=1, min_width=130):
+                        compare_search_btn = gr.Button("Search", elem_classes=["primary-btn"])
+
+                compare_candidates_state = gr.State([])
+                compare_list_state = gr.State([])
+
+                compare_radio = gr.Radio(
+                    choices=[], label="Which profile?", visible=False,
+                    elem_classes=["picker"], container=False,
+                )
+                with gr.Row():
+                    compare_add_btn = gr.Button("Add to comparison",
+                                                elem_classes=["primary-btn"], visible=False)
+                    compare_clear_btn = gr.Button("Clear list",
+                                                  elem_classes=["ghost-btn"], visible=False)
+
+                compare_chips = gr.HTML(visible=False)
+                compare_btn = gr.Button("Compare", elem_classes=["primary-btn"], visible=False)
+                compare_status = gr.HTML(visible=True, elem_classes=["status-slot"])
+                compare_plot = gr.Plot(label=None, visible=False)
+                compare_table = gr.HTML(visible=False)
+
             with gr.Tab("About"):
-                gr.Markdown("""
-## What is the Interdisciplinary Index?
+                gr.Markdown(
+                    latex_delimiters=[{"left": "$$", "right": "$$", "display": True},
+                                      {"left": "$", "right": "$", "display": False}],
+                    value=r"""
+## What this measures
 
-This tool measures how academic research crosses disciplinary boundaries. In an era where impactful discoveries often occur at the intersection of fields, understanding interdisciplinarity has become crucial for researchers, institutions, and funding bodies.
+Some research stays inside one field. Some of it draws on several, or gets picked
+up by people the author never reads. This tool puts four numbers on that, from a
+researcher's **25 most-cited papers** with an abstract and a DOI.
 
-A higher score indicates your work has broader impact across different fields, attracts diverse audiences, and draws from varied knowledge sources.
-
----
-
-## Why Measure Interdisciplinarity?
-
-**For Researchers:** Understand how your work is perceived across academia. Are you reaching audiences beyond your home discipline? Is your research bridging communities?
-
-**For Institutions:** Identify researchers who foster cross-departmental collaboration and whose work has broad institutional relevance.
-
-**For Funding Bodies:** Evaluate the potential for research to generate impact across multiple domains and address complex, multi-faceted problems.
+Two of the measures compare *text*, using an embedding model that turns each
+abstract into a vector. Two compare *fields*, using OpenAlex's subject
+classification. None of them is a grade — see **Reading the numbers** at the end.
 
 ---
 
-## The Four Metrics Explained
+## How one analysis works
 
-### 1. External Diversity (25% of composite score)
+| Step | Requests |
+|---|---|
+| Fetch the 25 most-cited papers, with abstracts and reference lists | 1 |
+| For each paper, sample up to 50 works citing it, with their abstracts and fields | 25 |
+| Look up the field of every referenced work, de-duplicated, 50 ids per request | ~10 |
+| Check the author record describes one person | 1 |
 
-**What it measures:** How different are the papers citing your work from your original papers?
-
-**Direction:** External — examines how *others* engage with your work
-
-**How it works:**
-- We analyze your top 10 most-cited papers and examine who cites them
-- Using neural embeddings (AI), we convert each paper's abstract into a mathematical vector
-- We measure the semantic "distance" between your papers and the papers that cite them
-- Greater distance = citations from more diverse fields = higher score
-
-**Example:** A genetics researcher whose work gets cited by ecology, public health, computer science, and sociology papers has high external diversity — their work resonates beyond their home field.
+Citing works are drawn with a **seeded random sample**, not "most recent" — the
+recent slice of a well-cited paper reflects whatever is currently fashionable.
+The same seed returns the same sample, so a rerun reproduces the result exactly.
+**Self-citations are excluded.**
 
 ---
 
-### 2. Internal Diversity (25% of composite score)
+## The measure of similarity
 
-**What it measures:** How spread out are your own research topics?
+Everything text-based rests on one operation. Each abstract becomes a vector
+$\mathbf{e}$, and the closeness of two abstracts is the cosine of the angle
+between their vectors:
 
-**Direction:** Internal — examines diversity *within* your own body of work
+$$\cos(\mathbf{a},\mathbf{b}) = \frac{\mathbf{a}\cdot\mathbf{b}}{\lVert\mathbf{a}\rVert\,\lVert\mathbf{b}\rVert}$$
 
-**How it works:**
-- We encode all your paper abstracts into embedding vectors using AI
-- We compute pairwise cosine distance between all your papers
-- Higher average distance = papers cover more different topics = higher diversity
-- Score = average pairwise distance × 100 (simple, transparent formula)
-- The heatmap visualization displays the similarity matrix (P1 = highest external diversity paper)
-
-**Example:** A researcher publishing in both "machine learning" and "neuroscience" will have higher distance between papers (higher internal diversity) than someone publishing only variations of "deep learning for image classification."
+It runs from 1 (same direction) through 0 (unrelated). **Distance** is
+$1-\cos$. Two papers on the same topic might sit at 0.7 similarity, two on
+unrelated topics at 0.2.
 
 ---
 
-### 3. Reference Diversity (25% of composite score)
+## 1 · External diversity — how far your work travels
 
-**What it measures:** How many different academic fields do you draw knowledge from?
+**The question:** are the people citing you working on the same thing you are?
 
-**How it works:**
-- We examine the references in your papers — who do you cite?
-- Each reference is tagged with its academic field using OpenAlex's classification
-- We calculate Shannon entropy, a measure from information theory that quantifies diversity
-- Higher entropy = more evenly distributed citations across fields = more diverse inputs
+For one paper $p$ with citing works $C_p$, take the average similarity between
+your abstract and theirs, then flip it so that *far* scores *high*:
 
-**Example:** Citing 50 biology papers and 50 economics papers yields higher entropy than citing 95 biology papers and 5 economics papers, even though both total 100 citations.
+$$E_p = 100 \times \left(1 - \frac{1}{|C_p|}\sum_{c \in C_p} \cos(\mathbf{e}_p, \mathbf{e}_c)\right)$$
 
----
+The score for the researcher is the mean of $E_p$ over their papers.
 
-### 4. Bridge Score (25% of composite score)
+**Worked example.** A paper's 50 citing works have similarities averaging 0.52.
+Then $E_p = 100 \times (1 - 0.52) = 48$. Had the citing work been closer in
+subject, averaging 0.70, the paper would score 30.
 
-**What it measures:** Does your work connect fields that don't normally interact?
-
-**How it works:**
-- We identify your "source fields" — disciplines you cite (your inputs)
-- We identify your "audience fields" — disciplines that cite you (your outputs)
-- Bridge fields are those that cite you but you don't cite back
-- More bridge fields = your work reaches unexpected communities
-
-**Example:** A computational biologist who cites biology and CS papers, but gets cited by physicists and social scientists, is building bridges — reaching audiences they didn't directly target.
+**Reading it:** high means your readers are working on something other than what
+you wrote. Low means the conversation around your paper stays close to it.
 
 ---
 
-## Understanding the Composite Score
+## 2 · Internal diversity — how far your own work ranges
 
-Each metric contributes equally (25%) to the composite score. This equal weighting approach is:
-- **Transparent** — no arbitrary decisions about which metric matters more
-- **Defensible** — each metric captures a distinct, complementary aspect of interdisciplinarity
-- **Simple** — easy to explain and interpret
+**The question:** do your own papers resemble each other?
 
-<div style="display: flex; gap: 32px; flex-wrap: wrap; margin: 24px 0; align-items: flex-start;">
-<div style="flex: 1; min-width: 300px;">
-<p style="font-weight: 700; margin-bottom: 8px;">Metric Weights:</p>
-<table style="width: 100%; border-collapse: collapse;">
-<thead><tr style="background: #111827;"><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Metric</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Weight</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">What it captures</th></tr></thead>
-<tbody>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">External Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Cross-field impact (who cites you)</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Reference Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Intellectual breadth (who you cite)</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Internal Diversity</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Research versatility (topic spread)</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Bridge Score</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">25%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Novel connections (asymmetric flows)</td></tr>
-</tbody></table>
-</div>
-<div style="flex: 1; min-width: 300px;">
-<p style="font-weight: 700; margin-bottom: 8px;">Score Interpretation:</p>
-<table style="width: 100%; border-collapse: collapse;">
-<thead><tr style="background: #111827;"><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Range</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">Category</th><th style="color: #fff; padding: 10px 14px; text-align: left; font-size: 0.75rem; text-transform: uppercase;">What it means</th></tr></thead>
-<tbody>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">0-20%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Low</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Highly focused within one discipline</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">20-50%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Moderate</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Some cross-field activity</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">50-80%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">High</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Significant interdisciplinary impact</td></tr>
-<tr><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">80-100%</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Very High</td><td style="padding: 10px 14px; border-bottom: 1px solid #E5E7EB;">Exceptional boundary-crossing research</td></tr>
-</tbody></table>
-</div>
-</div>
+Every pair of your papers, averaged:
+
+$$I = 100 \times \frac{2}{n(n-1)}\sum_{i \lt j}\bigl(1 - \cos(\mathbf{e}_i,\mathbf{e}_j)\bigr)$$
+
+With 25 papers that is 300 pairs. The **Paper similarity** heatmap shows the
+whole matrix; two dark blocks with a pale gap between them mean two separate
+strands of work.
+
+**This measure needs no citations at all**, so papers nothing has cited yet still
+count — restricting it to cited work would narrow it for no reason.
+
+**Reading it:** high means the papers cover different ground. But note that
+embedding distance partly reflects *writing*, not only subject: a methods paper
+and a theory paper in one field can sit far apart.
 
 ---
 
-## Understanding the Visualizations
+## 3 · Reference diversity — how widely you read
 
-**Paper Similarity Heatmap:** Shows how similar your papers are to each other. Darker blue = more similar. P1, P2, etc. correspond to table ranking (P1 = highest external diversity).
+**The question:** do the works you cite come from many fields, evenly, and are
+those fields far apart?
 
-**External Diversity by Year:** Tracks how your interdisciplinary impact has evolved over time.
+Counting fields is not enough. Citing Medicine and Nursing is not the same as
+citing Medicine and Astronomy, yet a plain count — or Shannon entropy — scores
+them identically. So this uses **Rao–Stirling diversity**, which folds in how far
+apart the fields are:
 
-**Fields Referenced / Who Cites You:** Bar charts showing the academic fields you draw from and that draw from you.
+$$RS = \sum_{i \neq j} d_{ij}\, p_i\, p_j$$
 
-**Knowledge Flow:** Compares fields you cite vs. fields that cite you.
+- $p_i$ — the share of your references in field $i$
+- $d_{ij}$ — the distance between fields $i$ and $j$
+
+Distance comes from OpenAlex's hierarchy, which nests 26 fields inside 4 domains
+(Health Sciences, Life Sciences, Physical Sciences, Social Sciences):
+
+| Relationship | $d_{ij}$ | Example |
+|---|---|---|
+| Same field | 0 | Medicine – Medicine |
+| Different field, same domain | 0.5 | Medicine – Nursing |
+| Different domain | 1.0 | Medicine – Physics and Astronomy |
+
+**Worked example.** Two reference lists, both split exactly in half, so both have
+identical entropy and both span "two fields":
+
+- 50% Medicine, 50% Nursing → both in Health Sciences → $RS = 2(0.5)(0.5)(0.5) = 0.25$ → **25**
+- 50% Medicine, 50% Astronomy → different domains → $RS = 2(0.5)(0.5)(1.0) = 0.50$ → **50**
+
+The second reads twice as diverse, which is the point. A count or an entropy
+would have called them the same.
+
+**Real profiles.** A deep-learning researcher whose references are 88% Computer
+Science, everything else scattered, scores about **18**. A biostatistician
+splitting 44% Medicine and 32% Mathematics — two different domains — scores
+about **65**.
+
+**Effective fields.** Alongside the score the profile reports
+$\exp(H)$, where $H = -\sum_i p_i \ln p_i$ — the number of *equally-used* fields
+that would produce the same spread. Four fields used evenly gives 4.0; 88% in one
+field with a long tail gives about 1.9. It is easier to read than the raw score.
 
 ---
 
-## Data & Methodology
+## 4 · Bridge — who reads you that you don't read
 
-**Data Source:** [OpenAlex](https://openalex.org/) — an open catalog of 250M+ scholarly works
+**The question:** how much of the attention your work gets comes from fields your
+own reading does not explain?
 
-**Process:**
-1. Fetch author's top 10 most-cited papers (must have abstract and DOI)
-2. For each paper, retrieve up to 50 most recent citing papers (sorted by publication date)
-3. For each paper, retrieve up to 50 references (papers you cite)
-4. Compute neural embeddings using Sentence Transformers
-5. Analyze field distributions using OpenAlex's topic classification
-6. Calculate all four metrics and combine into equal-weighted composite score
+For each field, compare its share of the work **citing** you against its share of
+the works **you cite**, and keep only the excess:
 
-**Limitations:**
-- Analyzes only top 10 papers (focuses on most impactful work)
-- Relies on OpenAlex's automated field classifications
-- Recent papers may have fewer citations, affecting scores
-- Self-citations are not filtered out
-                """)
+$$B = 100 \times \sum_{f} \max\bigl(0,\; a_f - s_f\bigr)$$
+
+- $a_f$ — field $f$'s share of the citing works
+- $s_f$ — field $f$'s share of your references
+
+This is the total variation distance between the two distributions, taken in one
+direction. It is bounded 0–100 and reads as *the share of your audience your own
+reading does not account for*.
+
+**Worked example.** A computer scientist:
+
+| Field | Share of references $s_f$ | Share of citers $a_f$ | $\max(0, a_f - s_f)$ |
+|---|---|---|---|
+| Computer Science | 88.3% | 66.2% | 0 — you cite it more than it cites you |
+| Engineering | 1.4% | 14.6% | **0.132** |
+| Everything else | 10.3% | 19.2% | **0.089** |
+
+$B = 100 \times (0 + 0.132 + 0.089) = 22$.
+
+Engineering carries most of it: they cite this author ten times more than the
+author cites them.
+
+**Why not simply count fields that cite you but that you never cite?** Because
+one stray citation from an unrelated field would then count as much as four
+hundred. Weighting by volume, a single paper out of 500 moves the score by 0.2
+rather than by several points. And because it is continuous, a field you cite a
+*little* but that cites you a *lot* still counts, in proportion — there is no
+threshold to fall the wrong side of.
+
+---
+
+## The composite
+
+$$\text{Composite} = \frac{E + I + RS + B}{4}$$
+
+Equal weights are a **choice**, not a neutral default, and the four are not
+independent: external and internal diversity are built from the same embedding
+space, reference diversity and bridge from the same field taxonomy. Averaging
+correlated measures counts the shared part twice. Prefer the four-part profile;
+treat the single number as a rough summary.
+
+---
+
+## Is the profile one person?
+
+OpenAlex assigns author identifiers algorithmically, so a record can hold several
+people's work, or one person's work can be split across records. A merged record
+is the dangerous case: unrelated papers read as range, so **all four measures rise
+at once** and the score peaks exactly when the data are worst.
+
+Before analysing, one request samples the record and checks:
+
+| Signal | Weight |
+|---|---|
+| Share of co-authors appearing on more than one paper | primary |
+| Number of distinct institutions across the work | primary |
+| Two or more conflicting ORCIDs on one record | conclusive |
+| Bylines naming more than one person | corroborating |
+| Implausible career span | corroborating |
+| Two field communities sharing almost no co-authors | corroborating |
+
+Co-author cohesion separates real breadth from a name collision: a genuine
+polymath keeps a recurring core of collaborators across fields; two people who
+share a name do not. Corroborating signals never warn alone — each has an honest
+explanation — so a warning needs a primary signal beside it.
+
+Measured on real records: clean profiles run 26–43% co-author repeat across 11–29
+institutions; a known merged record showed 8% across 65.
+
+---
+
+## Reading the numbers
+
+**There is no absolute scale here, and the interface deliberately shows no
+grades.** Any two scientific abstracts share a great deal of ordinary English, so
+the cosine-based measures rarely approach zero even for tightly focused work.
+A 50 does not mean "half as interdisciplinary as possible" — on its own it means
+very little.
+
+These numbers earn their keep by **comparison**: one researcher against another
+analysed the same way, or the same researcher at two points in a career. That is
+what the Compare tab is for.
+
+Other limits worth holding in mind:
+
+- Only the 25 most-cited papers are analysed, which favours older, established
+  work. Internal and reference diversity therefore describe the spread of a
+  researcher's most-cited output, not necessarily of everything they have written.
+- External diversity and bridge need papers that have been cited. Where a paper's
+  citing works carry no abstracts it is set aside, and the profile says how many.
+- Field distance uses OpenAlex's four-domain hierarchy, which is coarse: it cannot
+  tell that two Physical Sciences fields are further apart than two others.
+- Embedding distance partly reflects writing style and venue conventions, not only
+  subject matter.
+- Coverage is reported, not hidden: works OpenAlex has not classified are counted
+  and shown as a percentage beneath the profile.
+
+**Data source:** [OpenAlex](https://openalex.org/) · **Embeddings:**
+`minishlab/potion-base-32M` via Sentence Transformers
+""")
+
+
+        async def resolve_candidates(query: str) -> tuple[list[dict], str]:
+            """Look up a query; return (candidates, error_html)."""
+            if not (query or "").strip():
+                return [], ""
+            try:
+                found = await search_authors(query, limit=6)
+            except InvalidAPIKey as e:
+                return [], notice("OpenAlex rejected the API key", str(e), kind="warn")
+            except Throttled as e:
+                return [], notice("OpenAlex is throttling requests", str(e), kind="warn")
+            except Exception as e:
+                logger.error(f"Author search failed: {e}")
+                return [], notice("Search failed",
+                                  "Could not reach OpenAlex. Check your connection and try again.",
+                                  kind="warn")
+            if not found:
+                return [], notice("No matches",
+                                  f"Nothing in OpenAlex matches &ldquo;{query}&rdquo;. "
+                                  "Try a fuller name, or paste an ORCID.")
+            return found, ""
+
+        def same_name_banner(candidates: list[dict]) -> str:
+            twins = [c for c in candidates[1:]
+                     if c["name"].lower() == candidates[0]["name"].lower()]
+            if not twins:
+                return ""
+            stranded = sum(c["works_count"] for c in twins)
+            return notice(
+                "More than one profile carries this name",
+                f"{len(twins)} other {'profile holds' if len(twins) == 1 else 'profiles hold'} "
+                f"about {stranded:,} further works. OpenAlex may have split one person across "
+                "several records, or merged several people into one. Check the affiliation and "
+                "dates before choosing.", kind="warn")
 
         async def search_and_show_authors(query):
-            if not query.strip():
-                return gr.update(choices=[], visible=False), gr.update(visible=False), ""
-            candidates = await search_authors(query, limit=5)
+            candidates, problem = await resolve_candidates(query)
             if not candidates:
-                return gr.update(choices=[], visible=False), gr.update(visible=False), ""
-            choices = [(f"{c['name']} ({c['institution']}) - {c['works_count']} works, {c['cited_by_count']:,} citations" if c['institution'] else f"{c['name']} - {c['works_count']} works, {c['cited_by_count']:,} citations", c['id']) for c in candidates]
-            return gr.update(choices=choices, value=choices[0][1], visible=True), gr.update(visible=True), candidates[0]['id']
+                return (gr.update(choices=[], visible=False), gr.update(visible=False),
+                        gr.update(visible=False), "",
+                        gr.update(value=problem, visible=bool(problem)))
+            options = candidate_choices(candidates)
+            return (gr.update(choices=options, value=options[0][1], visible=True),
+                    gr.update(visible=True), gr.update(visible=True),
+                    candidates[0]["id"],
+                    gr.update(value=same_name_banner(candidates),
+                              visible=bool(same_name_banner(candidates))))
 
-        def create_progress_html(message: str) -> str:
-            return f"""<div class="progress-container"><div class="progress-spinner"></div><div class="progress-text">{message}</div><div class="progress-subtext">This may take a minute for new authors</div></div>"""
+        BLANK_RESULTS = 18
 
-        def show_progress():
-            return gr.update(value=create_progress_html("Analyzing"), visible=True)
 
-        def create_error_html(title: str, message: str) -> str:
-            return f"""<div class="results-card" style="border-color: #ef4444;">
-                <div style="text-align: center; padding: 32px;">
-                    <div style="font-size: 2rem; margin-bottom: 16px;">⚠️</div>
-                    <div style="font-size: 1.25rem; font-weight: 700; color: #111827; margin-bottom: 12px;">{title}</div>
-                    <div style="color: #6b7280;">{message}</div>
-                </div>
-            </div>"""
+
+        def fail(title: str, body: str):
+            out = [gr.update() for _ in range(BLANK_RESULTS)]
+            block = notice(title, body, kind="warn")
+            out[0] = gr.update(value=block, visible=True)
+            out[-1] = gr.update(value=block, visible=True)
+            return out
+
+        def stage(fraction, message):
+            """One frame of the run: only the status slots change.
+
+            Both are updated because the run can be started from either end of
+            the page and the feedback has to appear where the click happened.
+            """
+            out = [gr.update() for _ in range(BLANK_RESULTS)]
+            block = progress_block(fraction, message)
+            out[0] = gr.update(value=block, visible=True)
+            out[-1] = gr.update(value=block, visible=True)
+            return out
+
+        async def _analyse(author_id, cache_dir_val, force_refresh, progress, exclude_ids=None):
+            if not author_id:
+                yield fail("Pick a researcher first",
+                           "Search above, then choose the profile you want to analyse.")
+                return
+
+            yield stage(0.02, "Looking up the author")
+            coherence = {"verdict": "unknown"}
+            try:
+                async with httpx.AsyncClient(timeout=Config.REQUEST_TIMEOUT) as client:
+                    data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/authors/{author_id}")
+                    author_name = (data or {}).get("display_name") or "Unknown"
+                    # One extra call, before anything expensive: does this record
+                    # plausibly describe a single person? A merged record raises
+                    # every measure at once, so this has to be settled first.
+                    yield stage(0.05, "Checking the profile holds one person")
+                    coherence = assess_coherence(await fetch_author_signals(author_id, client))
+                    if coherence["verdict"] != "ok":
+                        logger.warning(f"Coherence {coherence['verdict']} for {author_id}: "
+                                       f"{'; '.join(coherence.get('flags', [])) or 'no detail'}")
+            except InvalidAPIKey as e:
+                yield fail("OpenAlex rejected the API key", str(e)); return
+            except Throttled as e:
+                yield fail("OpenAlex is throttling requests", str(e)); return
+            except RateLimitExceeded as e:
+                yield fail("OpenAlex daily limit reached", str(e)); return
+            except Exception as e:
+                logger.error(f"Author lookup failed: {e}")
+                yield fail("Could not reach OpenAlex",
+                           "The lookup failed before the analysis started. Try again in a moment.")
+                return
+
+            if force_refresh:
+                clear_author_cache(author_id, cache_dir_val)
+
+            # The analysis runs as a task while this loop reports what it is
+            # doing; a plain await would leave the interface silent for its
+            # whole duration.
+            live = {"frac": 0.08, "msg": f"Reading {author_name}"}
+
+            def note(frac, desc=""):
+                live["frac"], live["msg"] = frac, desc or live["msg"]
+
+            task = asyncio.create_task(
+                analyze_author(author_id, author_name, cache_dir_val, progress_cb=note,
+                               exclude_ids=set(exclude_ids or [])))
+            while not task.done():
+                yield stage(live["frac"], live["msg"])
+                await asyncio.sleep(0.2)
+
+            try:
+                out = task.result()
+            except InvalidAPIKey as e:
+                yield fail("OpenAlex rejected the API key", str(e)); return
+            except Throttled as e:
+                yield fail("OpenAlex is throttling requests", str(e)); return
+            except RateLimitExceeded as e:
+                yield fail("OpenAlex daily budget used up", str(e)); return
+            except NotEnoughData as e:
+                yield fail("Not enough indexed work to analyse", str(e)); return
+            except Exception as e:
+                logger.exception("Analysis failed")
+                yield fail("The analysis did not finish",
+                           f"Something went wrong partway through: {type(e).__name__}. "
+                           "The console log has the detail.")
+                return
+
+            (df_report, profile_html, df_top, scatter, kde_fig, dispersion_fig,
+             ref_fig, bridge_fig, field_fig, keyword_fig, explanation, html_path,
+             _metrics, detail) = out
+
+            # The warning belongs above the numbers it qualifies, not beside them.
+            profile_html = coherence_notice(coherence) + profile_html
+
+            yield [
+                gr.update(value="", visible=True),              # status slot: cleared
+                gr.update(value=profile_html, visible=True),    # results_html
+                gr.update(value=df_top, visible=True),          # top_papers_table
+                bridge_fig, dispersion_fig, ref_fig, field_fig, # charts row 1-2
+                scatter, kde_fig, keyword_fig,                  # charts row 3-4
+                df_report,                                      # papers_table
+                gr.update(value=explanation, visible=True),     # methodology
+                gr.update(value=html_path, visible=True),       # download
+                gr.update(visible=True),                        # charts_group
+                gr.update(visible=True),                        # papers_accordion
+                # the checkbox list is rebuilt from the papers that survived, and
+                # keeps whatever the user had already ticked
+                gr.update(choices=detail["paper_choices"],
+                          value=list(exclude_ids or []), visible=True),
+                gr.update(visible=True),                        # exclude_accordion
+                gr.update(value="", visible=True),              # mirrored status: cleared
+            ]
 
         async def run_analysis(author_id, cache_dir_val):
-            if not author_id:
-                return [gr.update()] * 16
+            async for frame in _analyse(author_id, cache_dir_val, False, None):
+                yield frame
+
+        async def rerun_analysis(author_id, cache_dir_val):
+            async for frame in _analyse(author_id, cache_dir_val, True, None):
+                yield frame
+
+        async def recalculate(author_id, cache_dir_val, excluded):
+            # No refetch: the cache already holds every paper, so dropping some
+            # is only a recomputation.
+            async for frame in _analyse(author_id, cache_dir_val, False, None, excluded):
+                yield frame
+
+        async def restore_all(author_id, cache_dir_val):
+            async for frame in _analyse(author_id, cache_dir_val, False, None, None):
+                yield frame
+
+        async def compare_search(query):
+            candidates, problem = await resolve_candidates(query)
+            if not candidates:
+                return (gr.update(choices=[], visible=False), [],
+                        gr.update(value=problem or "", visible=True),
+                        gr.update(visible=False))
+            options = candidate_choices(candidates)
+            return (gr.update(choices=options, value=options[0][1], visible=True),
+                    candidates, gr.update(value="", visible=True), gr.update(visible=True))
+
+        def render_chips(chosen: list[dict]) -> str:
+            if not chosen:
+                return ""
+            chips = "".join(
+                f'<span class="chip"><b>{c["name"]}</b>'
+                f'<span class="chip-meta">{c.get("institution") or c["id"]}</span></span>'
+                for c in chosen)
+            room = MAX_COMPARE - len(chosen)
+            tail = (f'<span class="chip-note">room for {room} more</span>' if room
+                    else '<span class="chip-note">list full</span>')
+            return f'<div class="chips">{chips}{tail}</div>'
+
+        def compare_add(picked_id, candidates, chosen):
+            chosen = list(chosen or [])
+            picked = next((c for c in (candidates or []) if c["id"] == picked_id), None)
+            if not picked:
+                return chosen, gr.update(visible=False), gr.update(visible=False), gr.update(visible=False)
+            if any(c["id"] == picked["id"] for c in chosen):
+                return (chosen,
+                        gr.update(value=render_chips(chosen) +
+                                  notice("Already on the list",
+                                         f"{picked['name']} is in the comparison."), visible=True),
+                        gr.update(visible=True), gr.update(visible=len(chosen) >= 2))
+            if len(chosen) >= MAX_COMPARE:
+                return (chosen,
+                        gr.update(value=render_chips(chosen) +
+                                  notice("List is full",
+                                         f"Comparisons hold {MAX_COMPARE} researchers. "
+                                         "Clear the list to start again."), visible=True),
+                        gr.update(visible=True), gr.update(visible=True))
+            chosen.append({"id": picked["id"], "name": picked["name"],
+                           "institution": picked.get("institution")})
+            return (chosen, gr.update(value=render_chips(chosen), visible=True),
+                    gr.update(visible=True), gr.update(visible=len(chosen) >= 2))
+
+        def compare_clear():
+            return ([], gr.update(visible=False), gr.update(visible=False),
+                    gr.update(visible=False), gr.update(value="", visible=True),
+                    gr.update(visible=False), gr.update(visible=False))
+
+        async def run_comparison(chosen, cache_dir_val):
+            hide = (gr.update(visible=False), gr.update(visible=False))
+
+            def problem(title, body):
+                return (gr.update(value=notice(title, body, kind="warn"), visible=True), *hide)
+
+            if not chosen or len(chosen) < 2:
+                yield problem("Not enough to compare", "Add at least two researchers.")
+                return
+
+            # Same reporting loop as the single analysis: a comparison runs one
+            # full analysis per researcher, so awaiting it silently would leave
+            # the interface blank for the better part of a minute.
+            live = {"frac": 0.0, "msg": "Starting"}
+
+            def note(frac, msg):
+                live["frac"], live["msg"] = frac, msg
+
+            task = asyncio.create_task(
+                analyse_for_comparison(chosen, cache_dir_val, on_step=note))
+            while not task.done():
+                yield (gr.update(value=progress_block(live["frac"], live["msg"]), visible=True), *hide)
+                await asyncio.sleep(0.2)
+
             try:
-                async with httpx.AsyncClient(timeout=30) as client:
-                    data = await fetch_with_retry(client, f"{OPENALEX_BASE_URL}/authors/{author_id}")
-                    author_name = data.get("display_name", "Unknown") if data else "Unknown"
-                results = await analyze_author(author_id, author_name, cache_dir_val)
-                return [
-                    gr.update(visible=False),
-                    results[0],
-                    gr.update(value=results[1], visible=True),
-                    gr.update(value=results[2], visible=True),
-                    gr.update(value=results[3], visible=True),
-                    results[4],
-                    results[5],
-                    gr.update(value=results[6], visible=True),
-                    results[7],
-                    results[8],
-                    results[9],
-                    results[10],
-                    gr.update(value=results[11], visible=True),
-                    gr.update(value=results[12], visible=True),
-                    gr.update(visible=True),
-                    gr.update(visible=True),
-                ]
-            except RateLimitExceeded as e:
-                error_html = create_error_html(
-                    "Daily Rate Limit Exceeded",
-                    f"OpenAlex's daily limit of 100,000 API requests has been reached. "
-                    f"Please try again tomorrow. Details: {str(e)}"
-                )
-                return [
-                    gr.update(value=error_html, visible=True),  # Show error in progress area
-                    *[gr.update()] * 15  # Keep other elements unchanged
-                ]
+                entries, problems = task.result()
+            except (RateLimitExceeded, Throttled, InvalidAPIKey) as e:
+                yield problem("OpenAlex is unavailable right now", str(e))
+                return
+            except Exception as e:
+                logger.exception("Comparison failed")
+                yield problem("The comparison did not finish",
+                              f"Something went wrong: {type(e).__name__}.")
+                return
 
-        search_btn.click(search_and_show_authors, [author_input], [author_dropdown, analyze_btn, selected_author_id])
-        author_input.submit(search_and_show_authors, [author_input], [author_dropdown, analyze_btn, selected_author_id])
-        author_dropdown.change(lambda x: x, [author_dropdown], [selected_author_id])
+            if len(entries) < 2:
+                yield problem("Could not build a comparison",
+                              "; ".join(problems) if problems else
+                              "not enough resolved to compare.")
+                return
 
-        analyze_btn.click(show_progress, None, [progress_html])
+            yield (gr.update(
+                       value=notice("Some entries were skipped", "; ".join(problems))
+                       if problems else "", visible=True),
+                   gr.update(value=create_comparison_chart(entries), visible=True),
+                   gr.update(value=comparison_table_html(entries)
+                                   + comparison_insights(entries), visible=True))
+
+        RESULT_SLOTS = [progress_html, results_html, top_papers_table,
+                        bridge_plot, dispersion_plot, ref_diversity_plot, field_breakdown_plot,
+                        scatter_plot, kde_plot, keywords_plot,
+                        papers_table, methodology_md, html_download,
+                        charts_group, papers_accordion,
+                        exclude_group, exclude_accordion, exclude_status]
+
+        SEARCH_SLOTS = [author_radio, analyze_btn, refresh_btn,
+                        selected_author_id, progress_html]
+
+        search_btn.click(search_and_show_authors, [author_input], SEARCH_SLOTS,
+                         show_progress="minimal", show_progress_on=[search_btn])
+        author_input.submit(search_and_show_authors, [author_input], SEARCH_SLOTS,
+                            show_progress="minimal", show_progress_on=[search_btn])
+        author_radio.change(lambda v: v or "", [author_radio], [selected_author_id])
+
         analyze_btn.click(run_analysis, [selected_author_id, cache_dir],
-            [progress_html, papers_table, results_html, bullet_chart, top_papers_table, scatter_plot, kde_plot, dispersion_plot,
-             ref_diversity_plot, bridge_plot, field_breakdown_plot, keywords_plot, methodology_md, html_download,
-             charts_accordion, papers_accordion])
+                          RESULT_SLOTS, show_progress="hidden")
+        refresh_btn.click(rerun_analysis, [selected_author_id, cache_dir],
+                          RESULT_SLOTS, show_progress="hidden")
+        recalc_btn.click(recalculate, [selected_author_id, cache_dir, exclude_group],
+                         RESULT_SLOTS, show_progress="hidden")
+        restore_btn.click(restore_all, [selected_author_id, cache_dir],
+                          RESULT_SLOTS, show_progress="hidden")
+
+        COMPARE_SEARCH_SLOTS = [compare_radio, compare_candidates_state,
+                                compare_status, compare_add_btn]
+        compare_search_btn.click(compare_search, [compare_search_box], COMPARE_SEARCH_SLOTS,
+                                 show_progress="minimal", show_progress_on=[compare_search_btn])
+        compare_search_box.submit(compare_search, [compare_search_box], COMPARE_SEARCH_SLOTS,
+                                  show_progress="minimal", show_progress_on=[compare_search_btn])
+        compare_add_btn.click(compare_add,
+                              [compare_radio, compare_candidates_state, compare_list_state],
+                              [compare_list_state, compare_chips, compare_clear_btn, compare_btn])
+        compare_clear_btn.click(compare_clear, None,
+                                [compare_list_state, compare_chips, compare_clear_btn,
+                                 compare_btn, compare_status, compare_plot, compare_table])
+        # Every output here starts hidden, so without an explicit anchor there
+        # was nothing for Gradio to draw progress on at all.
+        compare_btn.click(run_comparison, [compare_list_state, cache_dir],
+                          [compare_status, compare_plot, compare_table],
+                          show_progress="hidden")
 
     return demo
 
 if __name__ == "__main__":
-    demo = create_interface()
-    demo.launch()
+    sweep_stale_session_caches()
+    # Free single-entity fetch; the response reveals which budget applied, which
+    # is the only reliable way to tell an accepted key from an ignored one.
+    log_api_key_status(asyncio.run(verify_api_key()))
+    create_interface().launch(css=custom_css, theme=THEME, head=PAGE_HEAD)
