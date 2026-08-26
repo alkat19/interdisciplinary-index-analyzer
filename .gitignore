@@ -52,4 +52,5 @@ cache/
 
 # Local only — not published
 CLAUDE.md
-brand/
+brand/*
+!brand/ii-hex.svg
