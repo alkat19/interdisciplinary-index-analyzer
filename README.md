@@ -1,4 +1,4 @@
-# Interdisciplinary Index <img src="brand/ii-hex.svg" alt="Interdisciplinary Index" align="right" height="139" />
+# Interdisciplinary Index
 
 Some research stays inside one field. Some of it draws on several, or gets picked up
 by people the author never reads. This measures that, for any researcher in
@@ -183,7 +183,3 @@ whether it was accepted.
 [Sentence Transformers](https://www.sbert.net/) with
 [`minishlab/potion-base-32M`](https://huggingface.co/minishlab/potion-base-32M) ·
 [Plotly](https://plotly.com/) · [KeyBERT](https://github.com/MaartenGr/KeyBERT)
-
-The mark is a torii: its two posts are the twin **I**, and a torii is a threshold —
-which is what the tool measures, work crossing out of the field it came from. Cuts
-and geometry are in [`brand/`](brand/).

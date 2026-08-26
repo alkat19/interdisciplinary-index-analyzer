@@ -49,3 +49,7 @@ cache/
 
 # Claude Code local config
 .claude/
+
+# Local only — not published
+CLAUDE.md
+brand/
