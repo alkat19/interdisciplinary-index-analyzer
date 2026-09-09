@@ -79,15 +79,15 @@ citers contributes 13 points, while a single stray citation out of 500 moves the
 score by two-tenths. And it is continuous — no threshold for a field to fall the
 wrong side of.
 
-### The composite
+### The Fieldtrip Index
 
-The four pair into two axes: **range**, what the researcher themselves does, and
+The single number is the **Fieldtrip Index**. The four measures pair into two axes: **range**, what the researcher themselves does, and
 **reach**, how far the work travels.
 
 ```
-Range     = (I + RS) / 2
-Reach     = (E + B) / 2
-Composite = √(Range × Reach)
+Range           = (I + RS) / 2
+Reach           = (E + B) / 2
+Fieldtrip Index = √(Range × Reach)
 ```
 
 Each axis pairs one text measure with one field measure, so the two inputs come from

@@ -848,7 +848,7 @@ def create_scatter_chart(df: pd.DataFrame) -> go.Figure:
         x=df["year"].astype(int).tolist(),
         y=df["paper_index"].tolist(),
         mode="markers",
-        marker=dict(size=9, color=INK, line=dict(width=1.5, color=SURFACE)),
+        marker=dict(size=9, color=COOL, line=dict(width=1.5, color=SURFACE)),
         text=df["title"].tolist(),
         hovertemplate="%{text}<br>%{x} · external diversity %{y:.0f}<extra></extra>",
     ))
@@ -875,7 +875,7 @@ def create_kde_chart(similarities: list) -> go.Figure:
         fig = go.Figure(go.Scatter(
             x=x_vals.tolist(), y=kde(x_vals).tolist(),
             fill="tozeroy", mode="lines",
-            line=dict(color=INK, width=2), fillcolor="rgba(20,22,26,0.07)",
+            line=dict(color=COOL, width=2), fillcolor="rgba(42,120,214,0.10)",
             hovertemplate="similarity %{x:.2f}<extra></extra>",
         ))
         fig.update_layout(**get_chart_layout("Similarity to citing work"))
@@ -898,7 +898,7 @@ def create_keywords_chart(keyword_counts: list) -> go.Figure:
 
     fig = go.Figure(go.Bar(
         y=labels, x=values, orientation="h",
-        marker=dict(color=INK_2, line=dict(width=0)),
+        marker=dict(color=COOL, line=dict(width=0)),
         text=values, textposition="outside", cliponaxis=False,
         textfont=dict(size=11, color=INK, family=MONO),
         hovertemplate="%{y}<br>%{x} mentions<extra></extra>",
@@ -1112,12 +1112,12 @@ def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, comp
   <div class="card">
     <div class="profile-head">
       <div class="profile-who">{author_name}</div>
-      <div class="profile-id">composite {composite:.0f}</div>
+      <div class="profile-id">Fieldtrip Index {composite:.0f}</div>
     </div>
     {tracks}
     <p class="note">Each measure runs 0&ndash;100. Internal and reference diversity
     average into <em>range</em>, external diversity and bridge into <em>reach</em>, and
-    the composite is the geometric mean of the two.
+    the <em>Fieldtrip Index</em> is the geometric mean of the two.
     These are relative measures: because scientific abstracts share a great deal of
     language, the semantic scores rarely approach zero even for tightly focused work,
     so they are most useful compared against another researcher or against the same
@@ -1349,7 +1349,7 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
       <div class="profile-foot">
         <span>Range <b>{axes['range']:.0f}</b></span>
         <span>Reach <b>{axes['reach']:.0f}</b></span>
-        <span>Composite <b>{composite:.0f}</b></span>
+        <span>Fieldtrip Index <b>{composite:.0f}</b></span>
         <span>Papers analysed <b>{len(results)}</b>{shortfall}</span>
         <span>Topic spread over <b>{len(spread_abstracts)}</b></span>
         <span>Citing works <b>{n_citing}</b></span>
@@ -1365,8 +1365,8 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
 
 Each measures something different, on a 0&ndash;100 scale. They pair into two
 axes: **range**, what the researcher themselves does (internal + reference), and
-**reach**, how far the work travels (external + bridge). The composite is the
-geometric mean of the two, so it cannot be earned by one side alone.
+**reach**, how far the work travels (external + bridge). The **Fieldtrip Index** is
+the geometric mean of the two, so it cannot be earned by one side alone.
 
 | | What it measures |
 |---|---|
@@ -1388,7 +1388,7 @@ Prefer the four-part profile above to the single number.
     elapsed = (datetime.now() - start_time).total_seconds()
     logger.info(f"={'='*50}")
     logger.info(f"Analysis completed for {author_name}")
-    logger.info(f"      Time: {elapsed:.1f}s | Composite: {composite:.1f}")
+    logger.info(f"      Time: {elapsed:.1f}s | Fieldtrip Index: {composite:.1f}")
     logger.info(f"      Ext: {citation_index:.1f} | Int: {dispersion_data['dispersion_score']:.1f} | Ref: {ref_diversity['diversity_index']:.1f} | Bridge: {bridge_data['bridge_score']:.1f}")
     logger.info(f"={'='*50}")
 
@@ -1667,13 +1667,13 @@ def comparison_table_html(entries: list[dict]) -> str:
             f'<td class="num" data-label="Internal">{m["dispersion_score"]:.1f}</td>'
             f'<td class="num" data-label="Reference">{m["reference_diversity"]:.1f}</td>'
             f'<td class="num" data-label="Bridge">{m["bridge_score"]:.1f}</td>'
-            f'<td class="num strong" data-label="Composite">{composite_score(m)["composite"]:.1f}</td></tr>'
+            f'<td class="num strong" data-label="Fieldtrip Index">{composite_score(m)["composite"]:.1f}</td></tr>'
         )
     return (
         '<div class="table-card"><table class="data-table"><thead><tr><th>Researcher</th>'
         '<th class="c-num">External<br>diversity</th><th class="c-num">Internal<br>diversity</th>'
         '<th class="c-num">Reference<br>diversity</th><th class="c-num">Bridge</th>'
-        '<th class="c-num">Composite</th></tr></thead><tbody>' + "".join(body) + '</tbody></table></div>'
+        '<th class="c-num">Fieldtrip<br>Index</th></tr></thead><tbody>' + "".join(body) + '</tbody></table></div>'
     )
 
 
@@ -2392,14 +2392,14 @@ threshold to fall the wrong side of.
 
 ---
 
-## The composite
+## The Fieldtrip Index
 
-The four pair into two axes. **Range** is what the researcher themselves does;
+The single number is the **Fieldtrip Index**. The four measures pair into two axes. **Range** is what the researcher themselves does;
 **reach** is how far the work travels.
 
 $$\text{Range} = \frac{I + RS}{2} \qquad \text{Reach} = \frac{E + B}{2}$$
 
-$$\text{Composite} = \sqrt{\text{Range} \times \text{Reach}}$$
+$$\text{Fieldtrip Index} = \sqrt{\text{Range} \times \text{Reach}}$$
 
 Each axis pairs one text measure with one field measure, so the two inputs come
 from different sources and the shared signal is not counted twice. Inside an axis
