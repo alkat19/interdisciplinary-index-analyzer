@@ -151,8 +151,8 @@ rerun reproduces the result. Self-citations are excluded.
 Requires Python 3.10 or newer.
 
 ```bash
-git clone https://github.com/alkat19/interdisciplinary-index-analyzer.git
-cd interdisciplinary-index-analyzer
+git clone https://github.com/alkat19/fieldtrip-index.git
+cd fieldtrip-index
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 .venv/bin/python interdisciplinary_app.py
