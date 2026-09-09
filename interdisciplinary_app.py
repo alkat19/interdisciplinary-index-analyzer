@@ -1007,15 +1007,15 @@ body { background:var(--paper); color:var(--ink); font-family:var(--sans);
 .track-rail { position:relative; height:22px; }
 .track-rail::before { content:""; position:absolute; left:0; right:0; top:10px; height:2px;
                       background:var(--rule-soft); border-radius:1px; }
-.track-fill { position:absolute; left:0; top:10px; height:2px; background:var(--cool); border-radius:1px; }
-.track-mark { position:absolute; top:2px; width:2px; height:18px; background:var(--cool);
+.track-fill { position:absolute; left:0; top:10px; height:2px; background:var(--ink); border-radius:1px; }
+.track-mark { position:absolute; top:2px; width:2px; height:18px; background:var(--ink);
               border-radius:1px; transform:translateX(-1px); }
 .track-tick { position:absolute; top:14px; width:1px; height:4px; background:var(--rule); }
 .track-index { border-top:1px solid var(--rule); margin-top:4px; padding-top:18px; }
-.track-index .track-label { color:var(--cool); }
-.track-index .track-fill { height:4px; top:9px; border-radius:2px; }
-.track-index .track-mark { width:3px; }
-.track-index .track-val { color:var(--cool); }
+.track-index .track-label { color:var(--cool); font-weight:700; font-size:14px; }
+.track-index .track-fill { height:4px; top:9px; border-radius:2px; background:var(--cool); }
+.track-index .track-mark { width:3px; background:var(--cool); }
+.track-index .track-val { color:var(--cool); font-weight:700; font-size:26px; }
 .track-val { font-family:var(--mono); font-size:22px; font-weight:500; text-align:right;
              font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
 .profile-foot { display:flex; gap:24px; flex-wrap:wrap; padding-top:17px; margin-top:8px;
@@ -1830,14 +1830,14 @@ custom_css = """
     content: ""; position: absolute; left: 0; right: 0; top: 10px;
     height: 2px; background: var(--rule-soft); border-radius: 1px;
 }
-.track-fill { position: absolute; left: 0; top: 10px; height: 2px; background: var(--cool); border-radius: 1px; }
-.track-mark { position: absolute; top: 2px; width: 2px; height: 18px; background: var(--cool); border-radius: 1px; transform: translateX(-1px); }
+.track-fill { position: absolute; left: 0; top: 10px; height: 2px; background: var(--ink); border-radius: 1px; }
+.track-mark { position: absolute; top: 2px; width: 2px; height: 18px; background: var(--ink); border-radius: 1px; transform: translateX(-1px); }
 .track-tick { position: absolute; top: 14px; width: 1px; height: 4px; background: var(--rule); }
 .track-index { border-top: 1px solid var(--rule); margin-top: 4px; padding-top: 18px; }
-.track-index .track-label { color: var(--cool); }
-.track-index .track-fill { height: 4px; top: 9px; border-radius: 2px; }
-.track-index .track-mark { width: 3px; }
-.track-index .track-val { color: var(--cool); }
+.track-index .track-label { color: var(--cool); font-weight: 700; font-size: 14px; }
+.track-index .track-fill { height: 4px; top: 9px; border-radius: 2px; background: var(--cool); }
+.track-index .track-mark { width: 3px; background: var(--cool); }
+.track-index .track-val { color: var(--cool); font-weight: 700; font-size: 26px; }
 .track-val {
     font-family: var(--mono); font-size: 22px; font-weight: 500; text-align: right;
     font-variant-numeric: tabular-nums; letter-spacing: -0.02em; color: var(--ink);
