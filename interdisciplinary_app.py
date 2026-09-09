@@ -955,12 +955,13 @@ def create_comparison_chart(entries: list[dict]) -> go.Figure:
 # HTML EXPORT
 # ============================================================================
 
-def render_track(label: str, value: float) -> str:
-    """One row of the four-part profile: label, measured rail, value."""
+def render_track(label: str, value: float, index: bool = False) -> str:
+    """One row of the profile: label, measured rail, value. The Fieldtrip Index row
+    is set apart with a heavier rail."""
     v = max(0.0, min(100.0, float(value)))
     ticks = "".join(f'<div class="track-tick" style="left:{t}%"></div>' for t in (0, 25, 50, 75, 100))
     return (
-        '<div class="track">'
+        f'<div class="track{" track-index" if index else ""}">'
         f'<div class="track-label">{label}</div>'
         '<div class="track-rail">'
         f'{ticks}'
@@ -976,7 +977,7 @@ REPORT_CSS = """
 * { margin:0; padding:0; box-sizing:border-box; }
 :root {
   --paper:#FAFAFB; --surface:#FFFFFF; --ink:#14161A; --ink-2:#4A5058; --ink-3:#868D97;
-  --rule:#E4E7EB; --rule-soft:#F1F3F5;
+  --rule:#E4E7EB; --rule-soft:#F1F3F5; --cool:#2A78D6;
   --sans:'IBM Plex Sans',-apple-system,BlinkMacSystemFont,sans-serif;
   --mono:'IBM Plex Mono',ui-monospace,SFMono-Regular,monospace;
 }
@@ -1006,10 +1007,15 @@ body { background:var(--paper); color:var(--ink); font-family:var(--sans);
 .track-rail { position:relative; height:22px; }
 .track-rail::before { content:""; position:absolute; left:0; right:0; top:10px; height:2px;
                       background:var(--rule-soft); border-radius:1px; }
-.track-fill { position:absolute; left:0; top:10px; height:2px; background:var(--ink); border-radius:1px; }
-.track-mark { position:absolute; top:2px; width:2px; height:18px; background:var(--ink);
+.track-fill { position:absolute; left:0; top:10px; height:2px; background:var(--cool); border-radius:1px; }
+.track-mark { position:absolute; top:2px; width:2px; height:18px; background:var(--cool);
               border-radius:1px; transform:translateX(-1px); }
 .track-tick { position:absolute; top:14px; width:1px; height:4px; background:var(--rule); }
+.track-index { border-top:1px solid var(--rule); margin-top:4px; padding-top:18px; }
+.track-index .track-label { color:var(--cool); }
+.track-index .track-fill { height:4px; top:9px; border-radius:2px; }
+.track-index .track-mark { width:3px; }
+.track-index .track-val { color:var(--cool); }
 .track-val { font-family:var(--mono); font-size:22px; font-weight:500; text-align:right;
              font-variant-numeric:tabular-nums; letter-spacing:-.02em; }
 .profile-foot { display:flex; gap:24px; flex-wrap:wrap; padding-top:17px; margin-top:8px;
@@ -1087,6 +1093,7 @@ def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, comp
         + render_track("Internal diversity", metrics.get('dispersion_score', 0))
         + render_track("Reference diversity", metrics.get('reference_diversity', 0))
         + render_track("Bridge", metrics.get('bridge_score', 0))
+        + render_track("Fieldtrip Index", composite, index=True)
     )
 
     html_content = f'''<!DOCTYPE html>
@@ -1346,10 +1353,10 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
       {render_track("Internal diversity", dispersion_data['dispersion_score'])}
       {render_track("Reference diversity", ref_diversity['diversity_index'])}
       {render_track("Bridge", bridge_data['bridge_score'])}
+      {render_track("Fieldtrip Index", composite, index=True)}
       <div class="profile-foot">
         <span>Range <b>{axes['range']:.0f}</b></span>
         <span>Reach <b>{axes['reach']:.0f}</b></span>
-        <span>Fieldtrip Index <b>{composite:.0f}</b></span>
         <span>Papers analysed <b>{len(results)}</b>{shortfall}</span>
         <span>Topic spread over <b>{len(spread_abstracts)}</b></span>
         <span>Citing works <b>{n_citing}</b></span>
@@ -1823,9 +1830,14 @@ custom_css = """
     content: ""; position: absolute; left: 0; right: 0; top: 10px;
     height: 2px; background: var(--rule-soft); border-radius: 1px;
 }
-.track-fill { position: absolute; left: 0; top: 10px; height: 2px; background: var(--ink); border-radius: 1px; }
-.track-mark { position: absolute; top: 2px; width: 2px; height: 18px; background: var(--ink); border-radius: 1px; transform: translateX(-1px); }
+.track-fill { position: absolute; left: 0; top: 10px; height: 2px; background: var(--cool); border-radius: 1px; }
+.track-mark { position: absolute; top: 2px; width: 2px; height: 18px; background: var(--cool); border-radius: 1px; transform: translateX(-1px); }
 .track-tick { position: absolute; top: 14px; width: 1px; height: 4px; background: var(--rule); }
+.track-index { border-top: 1px solid var(--rule); margin-top: 4px; padding-top: 18px; }
+.track-index .track-label { color: var(--cool); }
+.track-index .track-fill { height: 4px; top: 9px; border-radius: 2px; }
+.track-index .track-mark { width: 3px; }
+.track-index .track-val { color: var(--cool); }
 .track-val {
     font-family: var(--mono); font-size: 22px; font-weight: 500; text-align: right;
     font-variant-numeric: tabular-nums; letter-spacing: -0.02em; color: var(--ink);
