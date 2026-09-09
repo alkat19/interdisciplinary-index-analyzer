@@ -17,6 +17,7 @@ import numpy as np
 import torch
 import logging
 import re
+import math
 import unicodedata
 import urllib.parse
 from datetime import datetime
@@ -1032,7 +1033,7 @@ td.n { font-family:var(--mono); font-variant-numeric:tabular-nums; text-align:ri
 """
 
 
-def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, composite_score: float,
+def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, composite: float,
                          scatter_fig, kde_fig, dispersion_fig, ref_div_fig, bridge_fig,
                          field_breakdown_fig, keyword_fig) -> str:
     tempdir = tempfile.gettempdir()
@@ -1109,10 +1110,12 @@ def generate_html_report(author_name: str, df: pd.DataFrame, metrics: dict, comp
   <div class="card">
     <div class="profile-head">
       <div class="profile-who">{author_name}</div>
-      <div class="profile-id">composite {composite_score:.0f}</div>
+      <div class="profile-id">composite {composite:.0f}</div>
     </div>
     {tracks}
-    <p class="note">Each measure runs 0&ndash;100 and the composite weights them equally.
+    <p class="note">Each measure runs 0&ndash;100. Internal and reference diversity
+    average into <em>range</em>, external diversity and bridge into <em>reach</em>, and
+    the composite is the geometric mean of the two.
     These are relative measures: because scientific abstracts share a great deal of
     language, the semantic scores rarely approach zero even for tightly focused work,
     so they are most useful compared against another researcher or against the same
@@ -1292,7 +1295,8 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
         'reference_diversity': ref_diversity['diversity_index'],
         'bridge_score': bridge_data['bridge_score'],
     }
-    composite_score = sum(all_metrics.values()) / len(all_metrics)
+    axes = composite_score(all_metrics)
+    composite = axes["composite"]
 
     scatter = create_scatter_chart(df) if not df.empty else None
     kde_fig = create_kde_chart(similarities_all)
@@ -1306,7 +1310,7 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
         df[["title", "doi", "year", "paper_index", "citation_count"]].to_dict("records"))
 
     df_report = df.rename(columns={"title": "Title", "year": "Year", "paper_index": "Index (%)"})
-    html_path = generate_html_report(author_name, df_report, all_metrics, composite_score, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, keyword_chart)
+    html_path = generate_html_report(author_name, df_report, all_metrics, composite, scatter, kde_fig, dispersion_chart, ref_diversity_chart, bridge_chart, field_breakdown_chart, keyword_chart)
 
     # ---- provenance / coverage, shown under the profile ----
     n_refs = ref_diversity["classified"] + ref_diversity["unclassified"]
@@ -1341,7 +1345,9 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
       {render_track("Reference diversity", ref_diversity['diversity_index'])}
       {render_track("Bridge", bridge_data['bridge_score'])}
       <div class="profile-foot">
-        <span>Composite <b>{composite_score:.0f}</b></span>
+        <span>Range <b>{axes['range']:.0f}</b></span>
+        <span>Reach <b>{axes['reach']:.0f}</b></span>
+        <span>Composite <b>{composite:.0f}</b></span>
         <span>Papers analysed <b>{len(results)}</b>{shortfall}</span>
         <span>Topic spread over <b>{len(spread_abstracts)}</b></span>
         <span>Citing works <b>{n_citing}</b></span>
@@ -1355,8 +1361,10 @@ async def analyze_author(author_id: str, author_name: str, cache_dir: str = None
 
     explanation = """### Reading these four numbers
 
-Each measures something different, on a 0&ndash;100 scale, and they are averaged
-into the composite with equal weight.
+Each measures something different, on a 0&ndash;100 scale. They pair into two
+axes: **range**, what the researcher themselves does (internal + reference), and
+**reach**, how far the work travels (external + bridge). The composite is the
+geometric mean of the two, so it cannot be earned by one side alone.
 
 | | What it measures |
 |---|---|
@@ -1371,14 +1379,14 @@ focused work &mdash; so a number here is most useful compared against another
 researcher, or against the same researcher over time, rather than read as an
 absolute grade. The four are also not independent: external and internal
 diversity share an embedding space, and reference diversity and bridge share a
-field taxonomy, so the composite counts some of the same signal more than once.
+field taxonomy. Each axis mixes one of each, which is why they are paired that way.
 Prefer the four-part profile above to the single number.
 """
 
     elapsed = (datetime.now() - start_time).total_seconds()
     logger.info(f"={'='*50}")
     logger.info(f"Analysis completed for {author_name}")
-    logger.info(f"      Time: {elapsed:.1f}s | Composite: {composite_score:.1f}")
+    logger.info(f"      Time: {elapsed:.1f}s | Composite: {composite:.1f}")
     logger.info(f"      Ext: {citation_index:.1f} | Int: {dispersion_data['dispersion_score']:.1f} | Ref: {ref_diversity['diversity_index']:.1f} | Bridge: {bridge_data['bridge_score']:.1f}")
     logger.info(f"={'='*50}")
 
@@ -1502,6 +1510,23 @@ MEASURE_LABELS = [
     ("reference_diversity", "reference diversity", "how widely they read"),
     ("bridge_score", "bridge", "how much of their audience their own reading does not explain"),
 ]
+
+def composite_score(metrics: dict) -> dict:
+    """Range, reach, and their geometric mean.
+
+    Range is what the researcher themselves does (internal + reference diversity);
+    reach is how far the work travels (external diversity + bridge). Each axis pairs
+    one text measure with one field measure, so the two inputs inside an axis come
+    from different sources and the shared signal is not counted twice. The axes are
+    averaged arithmetically because bridge is legitimately zero for a focused
+    researcher and must not zero out the whole axis; across axes the geometric mean
+    is deliberate — a lopsided profile is pulled toward its weaker side, so the
+    composite cannot be earned by one measure alone.
+    """
+    range_ = (metrics["dispersion_score"] + metrics["reference_diversity"]) / 2
+    reach = (metrics["citation_index"] + metrics["bridge_score"]) / 2
+    return {"range": range_, "reach": reach, "composite": math.sqrt(range_ * reach)}
+
 
 # Two 25-paper samples will differ by a few points for no reason at all. This is
 # a rule of thumb, not an interval — the app reports point estimates, so a gap
@@ -1640,7 +1665,7 @@ def comparison_table_html(entries: list[dict]) -> str:
             f'<td class="num" data-label="Internal">{m["dispersion_score"]:.1f}</td>'
             f'<td class="num" data-label="Reference">{m["reference_diversity"]:.1f}</td>'
             f'<td class="num" data-label="Bridge">{m["bridge_score"]:.1f}</td>'
-            f'<td class="num strong" data-label="Composite">{sum(m.values()) / 4:.1f}</td></tr>'
+            f'<td class="num strong" data-label="Composite">{composite_score(m)["composite"]:.1f}</td></tr>'
         )
     return (
         '<div class="table-card"><table class="data-table"><thead><tr><th>Researcher</th>'
@@ -2375,13 +2400,20 @@ threshold to fall the wrong side of.
 
 ## The composite
 
-$$\text{Composite} = \frac{E + I + RS + B}{4}$$
+The four pair into two axes. **Range** is what the researcher themselves does;
+**reach** is how far the work travels.
 
-Equal weights are a **choice**, not a neutral default, and the four are not
-independent: external and internal diversity are built from the same embedding
-space, reference diversity and bridge from the same field taxonomy. Averaging
-correlated measures counts the shared part twice. Prefer the four-part profile;
-treat the single number as a rough summary.
+$$\text{Range} = \frac{I + RS}{2} \qquad \text{Reach} = \frac{E + B}{2}$$
+
+$$\text{Composite} = \sqrt{\text{Range} \times \text{Reach}}$$
+
+Each axis pairs one text measure with one field measure, so the two inputs come
+from different sources and the shared signal is not counted twice. Inside an axis
+the mean is arithmetic, because bridge is legitimately zero for a focused
+researcher and should not zero out the axis. Across the axes it is geometric on
+purpose: a researcher with range 50 and reach 10 scores 22, not 30, because
+interdisciplinarity needs both. Prefer the four-part profile; the pair of axes says
+more than the product.
 
 ---
 

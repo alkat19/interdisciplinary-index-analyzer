@@ -81,10 +81,23 @@ wrong side of.
 
 ### The composite
 
-The unweighted mean of the four. Equal weights are a **choice**, not a neutral
-default, and the four are not independent — external and internal diversity share an
-embedding space, reference diversity and bridge share a field taxonomy. Prefer the
-four-part profile; read the single number as a rough summary.
+The four pair into two axes: **range**, what the researcher themselves does, and
+**reach**, how far the work travels.
+
+```
+Range     = (I + RS) / 2
+Reach     = (E + B) / 2
+Composite = √(Range × Reach)
+```
+
+Each axis pairs one text measure with one field measure, so the two inputs come from
+different sources and the shared signal is not counted twice — the four are not
+independent, since external and internal diversity share an embedding space and
+reference diversity and bridge share a field taxonomy. Inside an axis the mean is
+arithmetic, because bridge is legitimately zero for a focused researcher and should
+not zero out the axis. Across the axes it is geometric on purpose: range 50 with
+reach 10 scores 22, not 30, because interdisciplinarity needs both. Prefer the
+four-part profile; the pair of axes says more than the product.
 
 ---
 
