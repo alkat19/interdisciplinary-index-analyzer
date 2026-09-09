@@ -53,4 +53,7 @@ cache/
 # Local only — not published
 CLAUDE.md
 brand/*
-!brand/ii-hex.svg
+!brand/fieldtrip-hex.png
+!brand/fieldtrip-hex@512.png
+!brand/fieldtrip-hex@256.png
+!brand/fieldtrip-hex@64.png

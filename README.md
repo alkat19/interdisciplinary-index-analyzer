@@ -1,4 +1,4 @@
-# Interdisciplinary Index <img src="brand/ii-hex.svg" alt="Interdisciplinary Index" align="right" height="139" />
+# Fieldtrip Index <img src="brand/fieldtrip-hex@512.png" alt="Fieldtrip Index" align="right" height="139" />
 
 Some research stays inside one field. Some of it draws on several, or gets picked up
 by people the author never reads. This measures that, for any researcher in
